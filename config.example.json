@@ -1,0 +1,143 @@
+{
+  "active_trading": false,
+  "allowed_products": [
+    "ZEC-USDC",
+    "ONDO-USDC",
+    "ENA-USDC",
+    "NEAR-USDC",
+    "VVV-USDC"
+  ],
+  "bar_exec": "FIFTEEN_MINUTE",
+  "bar_trend": "ONE_HOUR",
+  "base_url": "https://api.coinbase.com",
+  "context_cache_path": "analysis/context_scores.json",
+  "context_overheated_24h_pct": 18,
+  "cooldown_minutes_after_trade": 45,
+  "daily_max_loss_pct": 0.02,
+  "daily_max_trades": 3,
+  "env_file": ".env",
+  "external_context_enabled": true,
+  "final_score_threshold": 5,
+  "lookback_exec_hours": 24,
+  "lookback_trend_hours": 96,
+  "market_context": {
+    "block_if_score_lte": -2,
+    "cache_ttl_seconds": 3600,
+    "enabled": true,
+    "provider": "coingecko_altfng_public"
+  },
+  "max_account_quote_pct_per_trade": 0.02,
+  "max_open_positions": 1,
+  "max_quote_per_trade": 25,
+  "min_quote_balance_to_trade": 15,
+  "min_quote_per_trade": 15,
+  "mode": "preview",
+  "news_context": {
+    "block_if_score_lte": -2,
+    "cache_ttl_seconds": 3600,
+    "enabled": true,
+    "max_items_per_product": 5,
+    "provider": "google_news_rss"
+  },
+  "no_averaging_down": true,
+  "prevent_same_asset_duplicate": true,
+  "quote_currency": "USDC",
+  "runs_log_path": "logs/runs.jsonl",
+  "score_threshold": 4,
+  "second_position_min_final_score": 8,
+  "second_position_min_score": 6,
+  "social_context": {
+    "block_if_score_lte": -2,
+    "cache_ttl_seconds": 3600,
+    "enabled": true,
+    "provider": "reddit_public_json_manual",
+    "reddit_activity_boost_min_posts": 5,
+    "reddit_limit": 8,
+    "reddit_subreddits": "CryptoCurrency+CryptoMarkets+altcoin"
+  },
+  "soft_invalidation_pct": 0.02,
+  "state_path": "state/state.json",
+  "stop_loss_pct": 0.07,
+  "strategy_name": "SerpentX Coinbase Spot USDC Rotator v1",
+  "take_profit_pct": 0.035,
+  "token_context": {
+    "ENA-USDC": {
+      "coingecko_id": "ethena",
+      "name": "Ethena",
+      "news_terms": [
+        "ENA",
+        "ENA crypto",
+        "Ethena"
+      ],
+      "social_notes": [],
+      "social_terms": [
+        "ENA",
+        "Ethena"
+      ]
+    },
+    "NEAR-USDC": {
+      "coingecko_id": "near",
+      "name": "NEAR Protocol",
+      "news_terms": [
+        "NEAR",
+        "NEAR crypto",
+        "NEAR Protocol"
+      ],
+      "social_notes": [],
+      "social_terms": [
+        "NEAR",
+        "NEAR Protocol"
+      ]
+    },
+    "ONDO-USDC": {
+      "coingecko_id": "ondo-finance",
+      "name": "Ondo",
+      "news_terms": [
+        "ONDO",
+        "ONDO crypto",
+        "Ondo"
+      ],
+      "social_notes": [],
+      "social_terms": [
+        "ONDO",
+        "Ondo"
+      ]
+    },
+    "VVV-USDC": {
+      "coingecko_id": "venice-token",
+      "name": "Venice Token",
+      "news_terms": [
+        "VVV",
+        "VVV crypto",
+        "Venice Token"
+      ],
+      "social_notes": [],
+      "social_terms": [
+        "VVV",
+        "Venice Token"
+      ]
+    },
+    "ZEC-USDC": {
+      "coingecko_id": "zcash",
+      "name": "Zcash",
+      "news_terms": [
+        "ZEC",
+        "ZEC crypto",
+        "Zcash"
+      ],
+      "social_notes": [],
+      "social_terms": [
+        "ZEC",
+        "Zcash"
+      ]
+    }
+  },
+  "trades_log_path": "logs/trades.jsonl",
+  "whale_context": {
+    "block_if_score_lte": -2,
+    "cache_ttl_seconds": 3600,
+    "enabled": true,
+    "helius_signature_limit": 20,
+    "provider": "helius_rpc_optional"
+  }
+}

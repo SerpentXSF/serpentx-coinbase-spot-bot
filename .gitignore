@@ -1,0 +1,15 @@
+.env
+.env.*
+!/.env.example
+config.json
+state/
+logs/
+analysis/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.DS_Store
+*.mp3
+*.wav
+*.jsonl
