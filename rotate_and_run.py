@@ -33,8 +33,8 @@ def save_json(path: Path, data):
     tmp.replace(path)
 
 
-def run(cmd):
-    return subprocess.run(cmd, cwd=str(ROOT), text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=360)
+def run(cmd, timeout=75):
+    return subprocess.run(cmd, cwd=str(ROOT), text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
 
 
 def main() -> int:
@@ -76,6 +76,10 @@ def main() -> int:
         'generated_at': analysis.get('generated_at'),
         'rotated_from': old,
         'rotated_to': top5,
+        'top5_short_candidates': [
+            {k: r.get(k) for k in ('product_id', 'short_score', 'long_score', 'directional_bias', 'change_24h', 'rsi')}
+            for r in analysis.get('top5_short_candidates', [])[:5]
+        ],
         'decision': result.get('decision'),
         'mode': result.get('mode'),
         'env_present': result.get('env_present'),

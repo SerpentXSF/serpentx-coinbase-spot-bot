@@ -13,3 +13,7 @@ venv/
 *.mp3
 *.wav
 *.jsonl
+*.pem
+*.key
+*.log
+.cache/
