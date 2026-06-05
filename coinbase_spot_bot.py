@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Coinbase Advanced Trade spot strategy bot for SerpentX/Hermes.
+"""Coinbase Advanced Trade spot strategy bot.
 
 Defaults are intentionally safe:
 - Loads credentials from a local .env file or environment variables.
@@ -101,7 +101,7 @@ def env_present() -> dict[str, bool]:
         "COINBASE_API_PRIVATE_KEY": bool(os.getenv("COINBASE_API_PRIVATE_KEY")),
         "COINBASE_TRADING_ENABLED": os.getenv("COINBASE_TRADING_ENABLED") == "1",
         "HELIUS_API_KEY": bool(os.getenv("HELIUS_API_KEY")),
-        "HELIUS_RPC_URL": bool(os.getenv("HELIUS_RPC_URL")),
+        "HELIUS_RPC_URL": bool(os.getenv("HELIUS_RPC_URL") or os.getenv("HELIUS_GATEKEEPER_RPC_URL")),
         "UNUSUAL_WHALES_API_KEY": bool(os.getenv("UNUSUAL_WHALES_API_KEY")),
     }
 
@@ -235,6 +235,14 @@ def product_info(product_id: str) -> dict[str, Any]:
     return public_get(f"/api/v3/brokerage/market/products/{product_id}")
 
 
+def is_market_orderable_product(info: dict[str, Any]) -> bool:
+    """True when Coinbase should accept market IOC orders for this product."""
+    if info.get("product") and isinstance(info.get("product"), dict):
+        info = info["product"]
+    if info.get("trading_disabled") or info.get("is_disabled") or info.get("cancel_only") or info.get("limit_only"):
+        return False
+    return str(info.get("status") or "").lower() == "online"
+
 
 NEGATIVE_CONTEXT_WORDS = {
     "hack", "hacked", "exploit", "exploited", "lawsuit", "sec", "delist", "delisting",
@@ -310,7 +318,7 @@ def _get_json_cached(cfg: dict[str, Any], cache: dict[str, Any], key: str, url: 
         return {**cached, "cached": True}
     out: dict[str, Any] = {"provider": provider, "fetched_at": utcnow().isoformat()}
     try:
-        r = requests.get(url, params=params, timeout=20, headers={"User-Agent": "SerpentXHermesBot/1.0"})
+        r = requests.get(url, params=params, timeout=20, headers={"User-Agent": "coinbase-spot-bot/1.0"})
         r.raise_for_status()
         out["data"] = r.json()
     except Exception as e:
@@ -339,7 +347,7 @@ def fetch_market_context(cfg: dict[str, Any], product_id: str, cache: dict[str, 
                     "https://api.coingecko.com/api/v3/coins/markets",
                     params={"vs_currency": "usd", "ids": cg_id, "price_change_percentage": "24h,7d"},
                     timeout=20,
-                    headers={"User-Agent": "SerpentXHermesBot/1.0"},
+                    headers={"User-Agent": "coinbase-spot-bot/1.0"},
                 )
                 r.raise_for_status()
                 rows = r.json()
@@ -415,7 +423,7 @@ def fetch_news_context(cfg: dict[str, Any], product_id: str, cache: dict[str, An
     params = {"q": f"({query}) crypto cryptocurrency", "hl": "en-US", "gl": "US", "ceid": "US:en"}
     out = {"score": 0, "reasons": [], "risk_block": False, "provider": "google_news_rss", "items": []}
     try:
-        r = requests.get(url, params=params, timeout=20, headers={"User-Agent": "SerpentXHermesBot/1.0"})
+        r = requests.get(url, params=params, timeout=20, headers={"User-Agent": "coinbase-spot-bot/1.0"})
         r.raise_for_status()
         titles = re.findall(r"<title><!\[CDATA\[(.*?)\]\]></title>|<title>(.*?)</title>", r.text, flags=re.S)
         parsed = []
@@ -460,7 +468,7 @@ def social_context(cfg: dict[str, Any], product_id: str, cache: dict[str, Any]) 
         q = " OR ".join(t for t in query_terms if t) or symbol
         url = f"https://www.reddit.com/r/{subreddits}/search.json"
         params = {"q": q, "restrict_sr": "on", "sort": "new", "t": "day", "limit": int(soc_cfg.get("reddit_limit", 8))}
-        r = requests.get(url, params=params, timeout=20, headers={"User-Agent": "SerpentXHermesBot/1.0"})
+        r = requests.get(url, params=params, timeout=20, headers={"User-Agent": "coinbase-spot-bot/1.0"})
         if r.status_code < 400:
             posts = r.json().get("data", {}).get("children", [])
             for post in posts:
@@ -504,7 +512,7 @@ def whale_context(cfg: dict[str, Any], product_id: str, cache: dict[str, Any]) -
         out.update({"provider": "not_applicable", "reasons": ["no Solana mint configured for this product; neutral"]})
         cache[key] = out
         return out
-    endpoint = os.getenv("HELIUS_RPC_URL")
+    endpoint = os.getenv("HELIUS_RPC_URL") or os.getenv("HELIUS_GATEKEEPER_RPC_URL")
     api_key = os.getenv("HELIUS_API_KEY")
     if not endpoint and api_key:
         endpoint = f"https://mainnet.helius-rpc.com/?api-key={api_key}"
@@ -574,6 +582,12 @@ class Signal:
 
 def score_product(cfg: dict[str, Any], product_id: str) -> Signal:
     info = product_info(product_id)
+    if info.get("product") and isinstance(info.get("product"), dict):
+        info = info["product"]
+    if not is_market_orderable_product(info):
+        s = Signal(product_id, fnum(info.get("price")), 0, "HOLD_USDC", ["product not market-orderable"], 50, fnum(info.get("price_percentage_change_24h")), fnum(info.get("volume_24h")))
+        s.risk_block = True
+        return s
     exec_c = fetch_candles(product_id, cfg["bar_exec"], int(cfg["lookback_exec_hours"]))
     trend_c = fetch_candles(product_id, cfg["bar_trend"], int(cfg["lookback_trend_hours"]))
     closes = [fnum(c.get("close")) for c in exec_c if fnum(c.get("close")) > 0]
@@ -778,6 +792,23 @@ def run(cfg: dict[str, Any], *, status: bool=False, live: bool=False) -> dict[st
     result["daily_trades_used"] = daily_trades
     result["open_positions"] = positions
 
+    if status and positions:
+        enriched_positions = []
+        for pos in positions:
+            pos_product = str(pos.get("product_id"))
+            entry = fnum(pos.get("entry_price"))
+            current = fnum(product_info(pos_product).get("price")) if pos_product else 0.0
+            pnl_pct = ((current - entry) / entry) if entry > 0 and current > 0 else 0.0
+            enriched_positions.append({
+                **pos,
+                "current_price": current,
+                "pnl_pct": pnl_pct,
+                "take_profit_price": entry * (1 + float(cfg["take_profit_pct"])),
+                "stop_loss_price": entry * (1 - float(cfg["stop_loss_pct"])),
+                "soft_invalidation_price": entry * (1 - float(cfg["soft_invalidation_pct"])),
+            })
+        result["open_positions"] = enriched_positions
+
     # First priority: manage exits for existing bot-opened positions. Only one
     # live order is sent per run, so exits take precedence over new entries.
     if positions and not status:
@@ -872,7 +903,8 @@ def run(cfg: dict[str, Any], *, status: bool=False, live: bool=False) -> dict[st
                     persist_positions(state, positions)
                     append_jsonl(Path(cfg["trades_log_path"]), {"ts": result["ts"], "side": "BUY", "order": order, "signal": entry_signal.__dict__, "quote_size": quote_size})
 
-    result["open_positions"] = normalize_positions(state)
+    if not (status and result.get("open_positions")):
+        result["open_positions"] = normalize_positions(state)
     state["last_run_at"] = result["ts"]
     state["last_decision"] = result["decision"]
     state["last_top"] = top.__dict__

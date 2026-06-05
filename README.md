@@ -1,6 +1,8 @@
-# Coinbase USDC Spot Algo Trading Bot
+# SerpentX Coinbase USDC Spot Bot
 
-Educational Coinbase Advanced Trade spot bot for scanning USDC crypto pairs, scoring trade candidates, and managing risk-gated market orders.
+Current version: **v0.2.0**
+
+Educational Coinbase Advanced Trade **spot** bot for scanning USDC crypto pairs, rotating a watchlist, and managing risk-gated market orders.
 
 > **Disclaimer:** This project is for education and experimentation. It is not financial advice, does not guarantee profits, and can lose money. Run in status/preview mode first. You are responsible for your own API keys, risk settings, taxes, and compliance.
 
@@ -8,10 +10,16 @@ Educational Coinbase Advanced Trade spot bot for scanning USDC crypto pairs, sco
 
 - Scans Coinbase spot products quoted in USDC.
 - Rotates the strongest candidates into a top-5 watchlist.
-- Scores candidates using technical momentum signals.
-- Adds optional external context from public/free data sources.
-- Manages bot-opened positions with take-profit, stop-loss, soft invalidation, cooldowns, and trade limits.
-- Defaults to safe/preview mode; live orders require multiple explicit gates.
+- Scores candidates using technical momentum signals plus optional public context.
+- Filters out Coinbase products marked trading-disabled, limit-only, cancel-only, or disabled before adding them to a market-order watchlist.
+- Tracks bot-managed open positions in local state.
+- Exits positions with take-profit, stop-loss, or soft-invalidation logic.
+- Includes a lightweight exit monitor that can run more often than the full market scanner.
+- Defaults to preview mode; live orders require multiple explicit gates.
+
+## Not required
+
+You do **not** need any specific agent, chat bot, or scheduler platform to run this bot. It is plain Python and can run on Linux, macOS, Windows/WSL, a VPS, or a local machine.
 
 ## Strategy overview
 
@@ -25,20 +33,25 @@ context_score = news_score + market_score + social_score + whale_score + risk_pe
 Technical scoring considers:
 
 - 15-minute EMA stack alignment
-- price above 1-hour EMA50
+- price vs 1-hour EMA50
+- 1-hour trend alignment
 - RSI support or pullback setup
-- 24-hour green/red movement
-- active Coinbase volume
+- 24-hour momentum
+- Coinbase volume/liquidity
 
-Context scoring can use:
+Optional public/free context can use:
 
-- Google News RSS for positive/negative headline keywords
+- Google News RSS headline keywords
 - CoinGecko market data and trending data
 - Alternative.me Fear & Greed Index
-- Reddit public JSON search for social sentiment
-- Helius RPC for Solana mint activity when you configure Solana mint addresses
+- Reddit public JSON search
+- Helius RPC for Solana mint activity when configured
 
-All external public sources are cached, defaulting to 1 hour, to reduce rate-limit pressure.
+All external sources are cached by default to reduce rate-limit pressure.
+
+## Spot-only behavior
+
+This bot is spot-only. It can buy qualified assets and sell back to USDC. It does **not** perform true shorting, leverage, futures, margin, or perps trading. Short/downside scoring is informational and can be used to avoid entries or hold USDC in bearish regimes.
 
 ## Safety design
 
@@ -70,7 +83,7 @@ Additional protections include:
 - API key with trading permission only if you intend to trade live
 - **No withdrawal/transfer permission** recommended
 
-Install Python dependencies:
+Install dependencies:
 
 ```bash
 python -m venv .venv
@@ -88,26 +101,26 @@ pip install -r requirements.txt
 
 ## Setup
 
-1. Clone or download this repository.
+1. Clone the repository.
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/coinbase-usdc-spot-bot.git
-cd coinbase-usdc-spot-bot
+git clone https://github.com/SerpentXSF/serpentx-coinbase-spot-bot.git
+cd serpentx-coinbase-spot-bot
 ```
 
-2. Create your local config and environment files.
+2. Create local config and environment files.
 
 ```bash
 cp config.example.json config.json
 cp .env.example .env
-chmod 600 .env
+chmod 600 .env  # Linux/macOS
 ```
 
 3. Edit `.env` and add your own Coinbase API credentials.
 
 ```text
 COINBASE_API_KEY_NAME=organizations/.../apiKeys/...
-COINBASE_API_PRIVATE_KEY="[PASTE_YOUR_PEM_PRIVATE_KEY_WITH_ESCAPED_NEWLINES]"
+COINBASE_API_PRIVATE_KEY="PASTE_YOUR_PEM_PRIVATE_KEY_WITH_ESCAPED_NEWLINES"
 COINBASE_TRADING_ENABLED=0
 ```
 
@@ -118,7 +131,7 @@ Keep `COINBASE_TRADING_ENABLED=0` until you intentionally enable live trading.
 ```text
 HELIUS_API_KEY=your_helius_key_here
 # or
-HELIUS_RPC_URL=[optional_full_helius_rpc_url]
+HELIUS_RPC_URL=optional_full_helius_rpc_url
 ```
 
 ## Basic usage
@@ -141,11 +154,29 @@ python coinbase_spot_bot.py --config config.json
 
 ### Rotate watchlist and run preview
 
-Scans all Coinbase USDC pairs, writes the top 5 to `config.json`, then runs the bot in preview mode.
+Scans Coinbase USDC pairs, writes the top 5 to `config.json`, then runs the bot in preview mode.
 
 ```bash
 python rotate_and_run.py --json
 ```
+
+### Lightweight exit monitor
+
+Checks existing bot-managed positions only. It does not scan the whole market and is designed to run more frequently than the rotator.
+
+Preview/status output:
+
+```bash
+python exit_monitor.py --json
+```
+
+Live exit monitor, after all live gates are intentionally enabled:
+
+```bash
+python exit_monitor.py --live
+```
+
+The monitor stays quiet on normal hold/no-position ticks unless `--json` is supplied.
 
 ### Live run
 
@@ -162,15 +193,27 @@ Only after you understand the risks and have reviewed your config:
 python coinbase_spot_bot.py --config config.json --live
 ```
 
-## Optional cron scheduling
+## Scheduling examples
 
-Linux/macOS example, every 6 hours:
+### Linux/macOS cron
+
+Every 6 hours, rotate the watchlist and run the strategy in preview mode:
 
 ```cron
-0 */6 * * * cd /path/to/coinbase-usdc-spot-bot && /path/to/coinbase-usdc-spot-bot/.venv/bin/python rotate_and_run.py --json >> logs/cron.log 2>&1
+0 */6 * * * cd /path/to/serpentx-coinbase-spot-bot && /path/to/serpentx-coinbase-spot-bot/.venv/bin/python rotate_and_run.py --json >> logs/cron.log 2>&1
 ```
 
-Start with preview/status scheduling before enabling live mode.
+Every 15 minutes, check exits only:
+
+```cron
+*/15 * * * * cd /path/to/serpentx-coinbase-spot-bot && /path/to/serpentx-coinbase-spot-bot/.venv/bin/python exit_monitor.py >> logs/exit-monitor.log 2>&1
+```
+
+For live mode, add `--live` only after enabling the config and env gates.
+
+### systemd timer / Docker / Windows Task Scheduler
+
+Any scheduler can run the same Python commands above. The project does not require any agent runtime or app platform.
 
 ## Files
 
@@ -178,7 +221,9 @@ Start with preview/status scheduling before enabling live mode.
 coinbase_spot_bot.py      Main strategy bot
 analyze_usdc_pairs.py     Public Coinbase USDC market scanner
 rotate_and_run.py         Refresh top-5 watchlist and run bot
+exit_monitor.py           Lightweight exit-only monitor
 coinbase_client.py        Minimal Coinbase Advanced Trade helper
+scripts/*.sh              Portable shell wrappers for cron/systemd
 config.example.json       Safe default config template
 .env.example              Secret template; copy to .env locally
 requirements.txt          Python dependencies
@@ -212,12 +257,8 @@ Use the least permissions required:
 ## Development checks
 
 ```bash
-python -m py_compile coinbase_spot_bot.py analyze_usdc_pairs.py rotate_and_run.py coinbase_client.py
+python -m py_compile coinbase_spot_bot.py analyze_usdc_pairs.py rotate_and_run.py exit_monitor.py coinbase_client.py
 python coinbase_spot_bot.py --config config.example.json --status
 ```
 
-The second command may use public endpoints and optional providers. Private account checks require a local `.env`.
-
-## License
-
-MIT
+The second command may use public endpoints and optional providers. Private account checks require your local `.env`.

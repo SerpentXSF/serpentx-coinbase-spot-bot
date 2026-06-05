@@ -15,6 +15,46 @@
   "cooldown_minutes_after_trade": 45,
   "daily_max_loss_pct": 0.02,
   "daily_max_trades": 3,
+  "directional_strategy": {
+    "downside_indicators": [
+      "15m EMA9<EMA21<EMA50",
+      "price below 1H EMA50",
+      "1H EMA20<EMA50",
+      "RSI 32-58 while trending down",
+      "24h negative momentum",
+      "quote volume/liquidity",
+      "avoid oversold snapback risk"
+    ],
+    "enabled": true,
+    "long_indicators": [
+      "15m EMA9>EMA21>EMA50",
+      "price above 1H EMA50",
+      "1H EMA20>EMA50",
+      "RSI 42-68 or trend pullback",
+      "24h positive momentum",
+      "quote volume/liquidity",
+      "news/social/market/whale context"
+    ],
+    "market_regimes": [
+      "bull",
+      "bear",
+      "range"
+    ],
+    "short_score_source": "analysis/usdc_pairs_latest.json -> top5_short_candidates",
+    "spot_bear_market_behavior": [
+      "sell bot-managed positions on take-profit, stop-loss, or soft-invalidation",
+      "hold USDC when downside regime is detected",
+      "record top short candidates for future derivatives routing"
+    ],
+    "spot_executor_direction": "long_only_plus_exits_to_usdc",
+    "true_shorting_enabled": false,
+    "true_shorting_requires": [
+      "verified Coinbase futures/perps or margin endpoint access",
+      "separate derivatives credentials/permissions",
+      "separate live gate such as COINBASE_DERIVATIVES_TRADING_ENABLED=1",
+      "explicit risk limits for leverage, liquidation buffer, funding, and max short notional"
+    ]
+  },
   "env_file": ".env",
   "external_context_enabled": true,
   "final_score_threshold": 5,
@@ -44,7 +84,7 @@
   "quote_currency": "USDC",
   "runs_log_path": "logs/runs.jsonl",
   "score_threshold": 4,
-  "second_position_min_final_score": 8,
+  "second_position_min_final_score": 7,
   "second_position_min_score": 6,
   "social_context": {
     "block_if_score_lte": -2,
@@ -55,11 +95,12 @@
     "reddit_limit": 8,
     "reddit_subreddits": "CryptoCurrency+CryptoMarkets+altcoin"
   },
-  "soft_invalidation_pct": 0.02,
+  "soft_invalidation_pct": 0.03,
   "state_path": "state/state.json",
-  "stop_loss_pct": 0.07,
+  "stop_loss_pct": 0.06,
   "strategy_name": "SerpentX Coinbase Spot USDC Rotator v1",
-  "take_profit_pct": 0.035,
+  "strategy_scope": "coinbase_spot_long_with_dual_direction_scoring",
+  "take_profit_pct": 0.0375,
   "token_context": {
     "ENA-USDC": {
       "coingecko_id": "ethena",
