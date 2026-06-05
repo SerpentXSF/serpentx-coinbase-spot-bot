@@ -235,6 +235,14 @@ def product_info(product_id: str) -> dict[str, Any]:
     return public_get(f"/api/v3/brokerage/market/products/{product_id}")
 
 
+def is_market_orderable_product(info: dict[str, Any]) -> bool:
+    """True when Coinbase should accept market IOC orders for this product."""
+    if info.get("product") and isinstance(info.get("product"), dict):
+        info = info["product"]
+    if info.get("trading_disabled") or info.get("is_disabled") or info.get("cancel_only") or info.get("limit_only"):
+        return False
+    return str(info.get("status") or "").lower() == "online"
+
 
 NEGATIVE_CONTEXT_WORDS = {
     "hack", "hacked", "exploit", "exploited", "lawsuit", "sec", "delist", "delisting",
@@ -574,6 +582,12 @@ class Signal:
 
 def score_product(cfg: dict[str, Any], product_id: str) -> Signal:
     info = product_info(product_id)
+    if info.get("product") and isinstance(info.get("product"), dict):
+        info = info["product"]
+    if not is_market_orderable_product(info):
+        s = Signal(product_id, fnum(info.get("price")), 0, "HOLD_USDC", ["product not market-orderable"], 50, fnum(info.get("price_percentage_change_24h")), fnum(info.get("volume_24h")))
+        s.risk_block = True
+        return s
     exec_c = fetch_candles(product_id, cfg["bar_exec"], int(cfg["lookback_exec_hours"]))
     trend_c = fetch_candles(product_id, cfg["bar_trend"], int(cfg["lookback_trend_hours"]))
     closes = [fnum(c.get("close")) for c in exec_c if fnum(c.get("close")) > 0]

@@ -9,6 +9,7 @@ Educational Coinbase Advanced Trade **spot** bot for scanning USDC crypto pairs,
 - Scans Coinbase spot products quoted in USDC.
 - Rotates the strongest candidates into a top-5 watchlist.
 - Scores candidates using technical momentum signals plus optional public context.
+- Filters out Coinbase products marked trading-disabled, limit-only, cancel-only, or disabled before adding them to a market-order watchlist.
 - Tracks bot-managed open positions in local state.
 - Exits positions with take-profit, stop-loss, or soft-invalidation logic.
 - Includes a lightweight exit monitor that can run more often than the full market scanner.

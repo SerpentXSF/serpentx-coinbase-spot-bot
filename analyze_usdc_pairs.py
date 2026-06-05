@@ -154,7 +154,18 @@ def score_product(p):
     return {**base(p), 'score':score, 'long_score':score, 'short_score':short_score, 'directional_bias':directional_bias, 'action':action, 'price':px, 'change_24h':chg, 'volume_24h':vol24, 'quote_volume_24h_usdc': quote_vol, 'rsi':rrsi, 'ema9':e9, 'ema21':e21, 'ema50':e50, 'trend_ema20':t20, 'trend_ema50':t50, 'avg_15m_range_pct':avg_range*100, 'reasons':reasons, 'short_reasons':short_reasons, 'cautions':cautions, 'short_cautions':short_cautions, 'quote_min_size': quote_min}
 
 def base(p):
-    return {'product_id':p.get('product_id'), 'base_currency_id':p.get('base_currency_id') or p.get('base_name'), 'quote_currency_id':p.get('quote_currency_id'), 'trading_disabled':p.get('trading_disabled'), 'status':p.get('status')}
+    return {'product_id':p.get('product_id'), 'base_currency_id':p.get('base_currency_id') or p.get('base_name'), 'quote_currency_id':p.get('quote_currency_id'), 'trading_disabled':p.get('trading_disabled'), 'limit_only':p.get('limit_only'), 'cancel_only':p.get('cancel_only'), 'is_disabled':p.get('is_disabled'), 'status':p.get('status')}
+
+def market_orderable(p):
+    """Return true only for products that should accept market IOC orders.
+
+    Coinbase can leave a product online while marking it limit_only/cancel_only.
+    This bot places market IOC orders, so those products must be excluded from
+    the live watchlist instead of failing at order time.
+    """
+    if p.get('trading_disabled') or p.get('is_disabled') or p.get('cancel_only') or p.get('limit_only'):
+        return False
+    return str(p.get('status') or '').lower() == 'online'
 
 def main():
     ps=products_all()
@@ -163,7 +174,7 @@ def main():
     for p in ps:
         pid=p.get('product_id','')
         base=pid.split('-',1)[0]
-        if pid.endswith('-USDC') and base not in excluded_bases and not p.get('trading_disabled'):
+        if pid.endswith('-USDC') and base not in excluded_bases and market_orderable(p):
             usdc.append(p)
     # Cron has a ~120s no_agent script limit. Scoring every USDC pair requires
     # two candle calls per product and can exceed that during slow Coinbase API
