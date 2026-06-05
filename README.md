@@ -1,5 +1,7 @@
 # SerpentX Coinbase USDC Spot Bot
 
+Current version: **v0.2.0**
+
 Educational Coinbase Advanced Trade **spot** bot for scanning USDC crypto pairs, rotating a watchlist, and managing risk-gated market orders.
 
 > **Disclaimer:** This project is for education and experimentation. It is not financial advice, does not guarantee profits, and can lose money. Run in status/preview mode first. You are responsible for your own API keys, risk settings, taxes, and compliance.
