@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Coinbase Advanced Trade spot strategy bot.
+"""Coinbase Advanced Trade spot strategy bot for SerpentX/Hermes.
 
 Defaults are intentionally safe:
-- Loads credentials from a local .env file or environment variables.
+- Loads credentials from a local .env file or environment.
 - Public market analysis works without credentials.
 - Private account verification requires COINBASE_API_KEY_NAME and COINBASE_API_PRIVATE_KEY.
 - Live orders require all three gates: config active_trading=true, COINBASE_TRADING_ENABLED=1, and --live.
@@ -38,7 +38,7 @@ except Exception:  # keep public/shadow analysis usable if auth libs are missing
 
 BASE_HOST = "api.coinbase.com"
 BASE_URL = f"https://{BASE_HOST}"
-ROOT = Path(os.getenv("COINBASE_BOT_HOME", Path(__file__).resolve().parent))
+ROOT = Path(os.getenv("COINBASE_BOT_ROOT", Path(__file__).resolve().parent)).resolve()
 DEFAULT_CONFIG = ROOT / "config.json"
 
 GRANULARITY_SECONDS = {
@@ -103,6 +103,9 @@ def env_present() -> dict[str, bool]:
         "HELIUS_API_KEY": bool(os.getenv("HELIUS_API_KEY")),
         "HELIUS_RPC_URL": bool(os.getenv("HELIUS_RPC_URL") or os.getenv("HELIUS_GATEKEEPER_RPC_URL")),
         "UNUSUAL_WHALES_API_KEY": bool(os.getenv("UNUSUAL_WHALES_API_KEY")),
+        "COINGECKO_API_KEY": bool(os.getenv("COINGECKO_API_KEY") or os.getenv("COINGECKO_DEMO_API_KEY") or os.getenv("COINGECKO_PRO_API_KEY")),
+        "COINMARKETCAP_API_KEY": bool(os.getenv("COINMARKETCAP_API_KEY")),
+        "BIRDEYE_API_KEY": bool(os.getenv("BIRDEYE_API_KEY")),
     }
 
 
@@ -241,7 +244,8 @@ def is_market_orderable_product(info: dict[str, Any]) -> bool:
         info = info["product"]
     if info.get("trading_disabled") or info.get("is_disabled") or info.get("cancel_only") or info.get("limit_only"):
         return False
-    return str(info.get("status") or "").lower() == "online"
+    return str(info.get("status") or "").lower() in {"", "online"}
+
 
 
 NEGATIVE_CONTEXT_WORDS = {
@@ -312,13 +316,25 @@ def _score_text_items(items: list[str], positive_words: set[str], negative_words
 
 
 
+def _market_headers(provider: str = "generic") -> dict[str, str]:
+    headers = {"User-Agent": "SerpentXHermesBot/1.0"}
+    if provider.startswith("coingecko"):
+        cg_key = os.getenv("COINGECKO_API_KEY") or os.getenv("COINGECKO_DEMO_API_KEY") or os.getenv("COINGECKO_PRO_API_KEY")
+        if cg_key:
+            headers["x-cg-demo-api-key"] = cg_key
+            headers["x-cg-pro-api-key"] = cg_key
+    if provider.startswith("coinmarketcap") and os.getenv("COINMARKETCAP_API_KEY"):
+        headers["X-CMC_PRO_API_KEY"] = os.getenv("COINMARKETCAP_API_KEY", "")
+    return headers
+
+
 def _get_json_cached(cfg: dict[str, Any], cache: dict[str, Any], key: str, url: str, params: dict[str, Any] | None, ttl: int, provider: str) -> dict[str, Any]:
     cached = cache.get(key)
     if isinstance(cached, dict) and _fresh(cached.get("fetched_at"), ttl):
         return {**cached, "cached": True}
     out: dict[str, Any] = {"provider": provider, "fetched_at": utcnow().isoformat()}
     try:
-        r = requests.get(url, params=params, timeout=20, headers={"User-Agent": "coinbase-spot-bot/1.0"})
+        r = requests.get(url, params=params, timeout=20, headers=_market_headers(provider))
         r.raise_for_status()
         out["data"] = r.json()
     except Exception as e:
@@ -347,7 +363,7 @@ def fetch_market_context(cfg: dict[str, Any], product_id: str, cache: dict[str, 
                     "https://api.coingecko.com/api/v3/coins/markets",
                     params={"vs_currency": "usd", "ids": cg_id, "price_change_percentage": "24h,7d"},
                     timeout=20,
-                    headers={"User-Agent": "coinbase-spot-bot/1.0"},
+                    headers=_market_headers("coingecko_markets"),
                 )
                 r.raise_for_status()
                 rows = r.json()
@@ -386,6 +402,36 @@ def fetch_market_context(cfg: dict[str, Any], product_id: str, cache: dict[str, 
     except Exception:
         pass
 
+
+    # CoinMarketCap quote context if a key is configured. Symbol lookup can be ambiguous,
+    # so it is a bounded +/-1 cross-check, never a standalone trade trigger.
+    cmc_key = os.getenv("COINMARKETCAP_API_KEY")
+    if cmc_key:
+        symbol = _base_symbol(product_id).upper()
+        cmc = _get_json_cached(
+            cfg, cache, f"coinmarketcap:quotes:{symbol}",
+            "https://pro-api.coinmarketcap.com/v1/cryptocurrency/quotes/latest",
+            {"symbol": symbol, "convert": "USD"}, ttl, "coinmarketcap_quotes"
+        )
+        try:
+            data = (cmc.get("data") or {}).get(symbol)
+            if isinstance(data, list):
+                data = data[0] if data else {}
+            quote = ((data or {}).get("quote") or {}).get("USD") or {}
+            cmc_chg24 = fnum(quote.get("percent_change_24h"))
+            cmc_vol = fnum(quote.get("volume_24h"))
+            cmc_mcap = fnum(quote.get("market_cap"))
+            cmc_vol_mcap = (cmc_vol / cmc_mcap) if cmc_mcap > 0 else 0.0
+            if data:
+                out["cmc_24h"] = cmc_chg24
+                out["cmc_volume_to_mcap"] = cmc_vol_mcap
+                if cmc_chg24 > 0 and cmc_vol_mcap >= 0.03:
+                    out["score"] += 1; out["reasons"].append("CoinMarketCap confirms positive/liquid momentum")
+                elif cmc_chg24 < -8 or (cmc_mcap > 0 and cmc_vol_mcap < 0.005):
+                    out["score"] -= 1; out["reasons"].append("CoinMarketCap weak momentum/liquidity warning")
+        except Exception:
+            pass
+
     # Market-wide fear/greed is a small risk modifier, cached globally.
     fng = _get_json_cached(cfg, cache, "alternative:fear_greed", "https://api.alternative.me/fng/", {"limit": 1, "format": "json"}, ttl, "alternative_fear_greed")
     try:
@@ -423,7 +469,7 @@ def fetch_news_context(cfg: dict[str, Any], product_id: str, cache: dict[str, An
     params = {"q": f"({query}) crypto cryptocurrency", "hl": "en-US", "gl": "US", "ceid": "US:en"}
     out = {"score": 0, "reasons": [], "risk_block": False, "provider": "google_news_rss", "items": []}
     try:
-        r = requests.get(url, params=params, timeout=20, headers={"User-Agent": "coinbase-spot-bot/1.0"})
+        r = requests.get(url, params=params, timeout=20, headers={"User-Agent": "SerpentXHermesBot/1.0"})
         r.raise_for_status()
         titles = re.findall(r"<title><!\[CDATA\[(.*?)\]\]></title>|<title>(.*?)</title>", r.text, flags=re.S)
         parsed = []
@@ -468,7 +514,7 @@ def social_context(cfg: dict[str, Any], product_id: str, cache: dict[str, Any]) 
         q = " OR ".join(t for t in query_terms if t) or symbol
         url = f"https://www.reddit.com/r/{subreddits}/search.json"
         params = {"q": q, "restrict_sr": "on", "sort": "new", "t": "day", "limit": int(soc_cfg.get("reddit_limit", 8))}
-        r = requests.get(url, params=params, timeout=20, headers={"User-Agent": "coinbase-spot-bot/1.0"})
+        r = requests.get(url, params=params, timeout=20, headers={"User-Agent": "SerpentXHermesBot/1.0"})
         if r.status_code < 400:
             posts = r.json().get("data", {}).get("children", [])
             for post in posts:
@@ -582,8 +628,6 @@ class Signal:
 
 def score_product(cfg: dict[str, Any], product_id: str) -> Signal:
     info = product_info(product_id)
-    if info.get("product") and isinstance(info.get("product"), dict):
-        info = info["product"]
     if not is_market_orderable_product(info):
         s = Signal(product_id, fnum(info.get("price")), 0, "HOLD_USDC", ["product not market-orderable"], 50, fnum(info.get("price_percentage_change_24h")), fnum(info.get("volume_24h")))
         s.risk_block = True
@@ -690,7 +734,7 @@ def dynamic_quote_size(cfg: dict[str, Any], quote_bal: float, top: Signal) -> fl
         size = min(size, min_q)
     if top.quote_volume < 1_000_000:
         size = min(size, min_q)
-    if top.change_24h > 20 or top.change_24h < -10:
+    if top.change_24h > float(cfg.get("overheated_size_down_pct", 20)) or top.change_24h < -10:
         size = min(size, min_q)
     size = min(size, pct_cap, quote_bal)
     return max(0.0, math.floor(size * 100) / 100)
@@ -724,18 +768,62 @@ def persist_positions(state: dict[str, Any], positions: list[dict[str, Any]]) ->
     state.pop("open_position", None)
 
 
-def choose_entry_signal(cfg: dict[str, Any], signals: list[Signal], positions: list[dict[str, Any]]) -> Signal | None:
+def product_cooldown_active(state: dict[str, Any], product_id: str, now: datetime | None = None) -> str | None:
+    "Return cooldown-until ISO string when this product is temporarily blocked."
+    now_s = (now or utcnow()).isoformat()
+    cooldowns = state.get("product_cooldowns", {})
+    if isinstance(cooldowns, dict):
+        until = cooldowns.get(product_id)
+        if isinstance(until, str) and until > now_s:
+            return until
+    return None
+
+
+def set_product_cooldown(state: dict[str, Any], product_id: str, minutes: float) -> None:
+    if not product_id or minutes <= 0:
+        return
+    cooldowns = state.setdefault("product_cooldowns", {})
+    if isinstance(cooldowns, dict):
+        cooldowns[product_id] = (utcnow() + timedelta(minutes=float(minutes))).isoformat()
+
+
+def trailing_exit_reason(cfg: dict[str, Any], pos: dict[str, Any], current: float, entry: float) -> str | None:
+    "Update high-water marks and return TRAILING_STOP when active drawdown fires."
+    if not cfg.get("trailing_stop_enabled", False) or entry <= 0 or current <= 0:
+        return None
+    pnl_pct = (current - entry) / entry
+    high = max(fnum(pos.get("high_water_price")), current)
+    if high > fnum(pos.get("high_water_price")):
+        pos["high_water_price"] = high
+        pos["high_water_pnl_pct"] = (high - entry) / entry
+    high_pnl = fnum(pos.get("high_water_pnl_pct"), pnl_pct)
+    activation = float(cfg.get("trailing_activation_pct", 0.035))
+    drawdown = float(cfg.get("trailing_drawdown_pct", 0.015))
+    if high_pnl >= activation and pnl_pct <= high_pnl - drawdown:
+        return "TRAILING_STOP"
+    return None
+
+
+def choose_entry_signal(cfg: dict[str, Any], signals: list[Signal], positions: list[dict[str, Any]], state: dict[str, Any] | None = None) -> Signal | None:
+    state = state or {}
     held = {str(p.get("product_id")) for p in positions}
     prevent_dup = bool(cfg.get("prevent_same_asset_duplicate", True))
     second_min = int(cfg.get("second_position_min_final_score", cfg.get("second_position_min_score", cfg.get("score_threshold", 4))))
     for sig in signals:
         if sig.action != "BUY" or sig.risk_block:
             continue
+        if product_cooldown_active(state, sig.product_id):
+            continue
         if prevent_dup and sig.product_id in held:
             continue
         effective_score = int(sig.final_score or sig.score)
         if positions and effective_score < second_min:
             continue
+        if sig.change_24h >= float(cfg.get("overheated_require_context_pct", 50)):
+            if sig.change_24h >= float(cfg.get("overheated_block_pct", 100)):
+                continue
+            if sig.context_score <= 0 or effective_score < int(cfg.get("min_final_score_when_overheated", 7)):
+                continue
         return sig
     return None
 
@@ -820,7 +908,6 @@ def run(cfg: dict[str, Any], *, status: bool=False, live: bool=False) -> dict[st
             current = fnum(product_info(pos_product).get("price")) if pos_product else 0.0
             base_size = min(fnum(pos.get("base_size_est")), balances.get(base, 0.0))
             pnl_pct = ((current - entry) / entry) if entry > 0 and current > 0 else 0.0
-            enriched = {**pos, "current_price": current, "pnl_pct": pnl_pct}
             sell_reason = None
             if pnl_pct >= float(cfg["take_profit_pct"]):
                 sell_reason = "TAKE_PROFIT"
@@ -834,6 +921,10 @@ def run(cfg: dict[str, Any], *, status: bool=False, live: bool=False) -> dict[st
                         result["position_signal"] = pos_signal.__dict__
                 except Exception as e:
                     result["position_signal_error"] = str(e)[:200]
+            trailing_reason = trailing_exit_reason(cfg, pos, current, entry)
+            if trailing_reason and not sell_reason:
+                sell_reason = trailing_reason
+            enriched = {**pos, "current_price": current, "pnl_pct": pnl_pct}
             if sell_reason and base_size > 0:
                 result["open_position"] = enriched
                 result["proposed_order"] = {"product_id": pos_product, "side": "SELL", "base_size": base_size, "reason": sell_reason}
@@ -847,6 +938,10 @@ def run(cfg: dict[str, Any], *, status: bool=False, live: bool=False) -> dict[st
                     result["decision"] = "ORDER_SENT"
                     result["order"] = order
                     state["cooldown_until"] = (utcnow() + timedelta(minutes=float(cfg["cooldown_minutes_after_trade"]))).isoformat()
+                    if sell_reason in {"STOP_LOSS", "SOFT_INVALIDATION", "TRAILING_STOP"}:
+                        set_product_cooldown(state, pos_product, float(cfg.get("per_product_cooldown_minutes_after_stop", 720)))
+                    else:
+                        set_product_cooldown(state, pos_product, float(cfg.get("per_product_cooldown_minutes_after_trade", 180)))
                     append_jsonl(Path(cfg["trades_log_path"]), {"ts": result["ts"], "side": "SELL", "reason": sell_reason, "order": order, "position": pos})
                 updated_positions.extend(p for p in positions if p is not pos)
                 persist_positions(state, updated_positions)
@@ -862,7 +957,7 @@ def run(cfg: dict[str, Any], *, status: bool=False, live: bool=False) -> dict[st
         result["decision"] = "STATUS_ONLY"
     elif result["decision"] == "SHADOW_ONLY":
         positions = normalize_positions(state)
-        entry_signal = choose_entry_signal(cfg, signals, positions)
+        entry_signal = choose_entry_signal(cfg, signals, positions, state)
         if not balances:
             result["decision"] = "NEEDS_CREDENTIALS_FOR_PREVIEW_OR_TRADE"
         elif in_cooldown:
@@ -899,6 +994,8 @@ def run(cfg: dict[str, Any], *, status: bool=False, live: bool=False) -> dict[st
                         "quote_size": quote_size,
                         "base_size_est": quote_size / entry_signal.price if entry_signal.price > 0 else 0.0,
                         "opened_at": result["ts"],
+                        "high_water_price": entry_signal.price,
+                        "high_water_pnl_pct": 0.0,
                     })
                     persist_positions(state, positions)
                     append_jsonl(Path(cfg["trades_log_path"]), {"ts": result["ts"], "side": "BUY", "order": order, "signal": entry_signal.__dict__, "quote_size": quote_size})

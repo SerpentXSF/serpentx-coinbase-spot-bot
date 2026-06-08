@@ -13,13 +13,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from datetime import timedelta
 from pathlib import Path
-import os
 from typing import Any
 
-ROOT = Path(os.getenv("COINBASE_BOT_HOME", Path(__file__).resolve().parent))
+ROOT = Path(os.getenv("COINBASE_BOT_ROOT", Path(__file__).resolve().parent)).resolve()
 sys.path.insert(0, str(ROOT))
 
 import coinbase_spot_bot as bot  # noqa: E402
@@ -33,6 +33,30 @@ def _round_money(x: float) -> float:
 
 def _event(result: dict[str, Any]) -> str:
     return json.dumps(result, indent=2, sort_keys=True)
+
+
+def _set_product_cooldown(state: dict[str, Any], product_id: str, minutes: float) -> None:
+    if not product_id or minutes <= 0:
+        return
+    cooldowns = state.setdefault("product_cooldowns", {})
+    if isinstance(cooldowns, dict):
+        cooldowns[product_id] = (bot.utcnow() + timedelta(minutes=float(minutes))).isoformat()
+
+
+def _trailing_exit_reason(cfg: dict[str, Any], pos: dict[str, Any], current: float, entry: float) -> str | None:
+    if not cfg.get("trailing_stop_enabled", False) or entry <= 0 or current <= 0:
+        return None
+    pnl_pct = (current - entry) / entry
+    high = max(bot.fnum(pos.get("high_water_price")), current)
+    if high > bot.fnum(pos.get("high_water_price")):
+        pos["high_water_price"] = high
+        pos["high_water_pnl_pct"] = (high - entry) / entry
+    high_pnl = bot.fnum(pos.get("high_water_pnl_pct"), pnl_pct)
+    activation = float(cfg.get("trailing_activation_pct", 0.035))
+    drawdown = float(cfg.get("trailing_drawdown_pct", 0.015))
+    if high_pnl >= activation and pnl_pct <= high_pnl - drawdown:
+        return "TRAILING_STOP"
+    return None
 
 
 def run(*, live: bool = False, json_status: bool = False) -> dict[str, Any]:
@@ -111,6 +135,20 @@ def run(*, live: bool = False, json_status: bool = False) -> dict[str, Any]:
             except Exception as exc:  # do not convert a soft check failure into a cron error
                 result["position_signal_error"] = str(exc)[:300]
 
+        trailing_reason = _trailing_exit_reason(cfg, pos, current, entry)
+        if trailing_reason and not sell_reason:
+            sell_reason = trailing_reason
+            enriched = {
+                **pos,
+                "current_price": _round_money(current),
+                "pnl_pct": pnl_pct,
+                "take_profit_price": _round_money(entry * (1 + float(cfg["take_profit_pct"]))),
+                "stop_loss_price": _round_money(entry * (1 - float(cfg["stop_loss_pct"]))),
+                "soft_invalidation_price": _round_money(entry * (1 - float(cfg["soft_invalidation_pct"]))),
+                "available_base_balance": balances.get(base, 0.0),
+                "exit_base_size": base_size,
+            }
+
         if sell_reason and base_size > 0:
             result["decision"] = "EXIT_SIGNAL"
             result["open_position"] = enriched
@@ -130,6 +168,10 @@ def run(*, live: bool = False, json_status: bool = False) -> dict[str, Any]:
                 result["decision"] = "ORDER_SENT"
                 result["order"] = order
                 state["cooldown_until"] = (bot.utcnow() + timedelta(minutes=float(cfg["cooldown_minutes_after_trade"]))).isoformat()
+                if sell_reason in {"STOP_LOSS", "SOFT_INVALIDATION", "TRAILING_STOP"}:
+                    _set_product_cooldown(state, product_id, float(cfg.get("per_product_cooldown_minutes_after_stop", 720)))
+                else:
+                    _set_product_cooldown(state, product_id, float(cfg.get("per_product_cooldown_minutes_after_trade", 180)))
                 bot.append_jsonl(Path(cfg["trades_log_path"]), {
                     "ts": result["ts"],
                     "side": "SELL",

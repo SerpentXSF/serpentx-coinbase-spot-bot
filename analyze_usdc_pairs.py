@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import json, time, math, os
+import json, math, os, time
 from datetime import datetime, timezone
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
 
 BASE='https://api.coinbase.com'
-ROOT=Path(os.getenv('COINBASE_BOT_HOME', Path(__file__).resolve().parent))
-OUTDIR=ROOT/'analysis'
+ROOT=Path(os.getenv('COINBASE_BOT_ROOT', Path(__file__).resolve().parent)).resolve()
+OUTDIR=ROOT / 'analysis'
 OUTDIR.mkdir(parents=True, exist_ok=True)
 
 GRAN = {'FIFTEEN_MINUTE': 900, 'ONE_HOUR': 3600}
@@ -157,15 +157,16 @@ def base(p):
     return {'product_id':p.get('product_id'), 'base_currency_id':p.get('base_currency_id') or p.get('base_name'), 'quote_currency_id':p.get('quote_currency_id'), 'trading_disabled':p.get('trading_disabled'), 'limit_only':p.get('limit_only'), 'cancel_only':p.get('cancel_only'), 'is_disabled':p.get('is_disabled'), 'status':p.get('status')}
 
 def market_orderable(p):
-    """Return true only for products that should accept market IOC orders.
+    """Return true only for products that should accept market orders.
 
-    Coinbase can leave a product online while marking it limit_only/cancel_only.
-    This bot places market IOC orders, so those products must be excluded from
-    the live watchlist instead of failing at order time.
+    Coinbase can leave a product online but set limit_only=true. Those products
+    may pass market previews but reject the live order with: "Orderbook is in
+    limit only mode - please use limit order type". The rotator places market
+    IOC orders only, so exclude them from the live watchlist entirely.
     """
     if p.get('trading_disabled') or p.get('is_disabled') or p.get('cancel_only') or p.get('limit_only'):
         return False
-    return str(p.get('status') or '').lower() == 'online'
+    return str(p.get('status') or '').lower() in {'', 'online'}
 
 def main():
     ps=products_all()

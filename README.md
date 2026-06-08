@@ -1,6 +1,6 @@
 # SerpentX Coinbase USDC Spot Bot
 
-Current version: **v0.2.0**
+Current version: **v0.3.0-beta**
 
 Educational Coinbase Advanced Trade **spot** bot for scanning USDC crypto pairs, rotating a watchlist, and managing risk-gated market orders.
 
@@ -178,6 +178,36 @@ python exit_monitor.py --live
 
 The monitor stays quiet on normal hold/no-position ticks unless `--json` is supplied.
 
+### Local performance dashboard
+
+Run a local, read-only dashboard from your own bot state/log files:
+
+```bash
+python trade_analytics_dashboard.py --host 127.0.0.1 --port 8787
+```
+
+Then open:
+
+```text
+http://127.0.0.1:8787
+```
+
+The dashboard is designed for local use. It reads files such as `state/state.json`, `logs/runs.jsonl`, and `trades.jsonl` when present. Do not expose the dashboard publicly unless you understand your network, proxy, and authentication setup.
+
+If your live bot state is in another folder, point the dashboard at it without moving secrets:
+
+```bash
+COINBASE_BOT_ROOT=/path/to/your/local/bot python trade_analytics_dashboard.py --host 127.0.0.1 --port 8787
+```
+
+### Candidate forward backtest
+
+Replay recent scanner output against later public candles to sanity-check candidate selection:
+
+```bash
+python candidate_forward_backtest.py --help
+```
+
 ### Live run
 
 Only after you understand the risks and have reviewed your config:
@@ -222,7 +252,10 @@ coinbase_spot_bot.py      Main strategy bot
 analyze_usdc_pairs.py     Public Coinbase USDC market scanner
 rotate_and_run.py         Refresh top-5 watchlist and run bot
 exit_monitor.py           Lightweight exit-only monitor
+trade_analytics_dashboard.py Local read-only performance dashboard
+candidate_forward_backtest.py Candidate follow-through analysis helper
 coinbase_client.py        Minimal Coinbase Advanced Trade helper
+DUAL_DIRECTION_SETUP.md    Notes on spot-safe dual-direction scoring
 scripts/*.sh              Portable shell wrappers for cron/systemd
 config.example.json       Safe default config template
 .env.example              Secret template; copy to .env locally
@@ -257,7 +290,7 @@ Use the least permissions required:
 ## Development checks
 
 ```bash
-python -m py_compile coinbase_spot_bot.py analyze_usdc_pairs.py rotate_and_run.py exit_monitor.py coinbase_client.py
+python -m py_compile coinbase_spot_bot.py analyze_usdc_pairs.py rotate_and_run.py exit_monitor.py coinbase_client.py trade_analytics_dashboard.py candidate_forward_backtest.py
 python coinbase_spot_bot.py --config config.example.json --status
 ```
 
