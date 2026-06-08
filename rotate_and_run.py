@@ -16,7 +16,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-ROOT = Path(os.getenv('COINBASE_BOT_HOME', Path(__file__).resolve().parent))
+ROOT = Path(os.getenv('COINBASE_BOT_ROOT', Path(__file__).resolve().parent)).resolve()
 CONFIG = ROOT / 'config.json'
 LATEST = ROOT / 'analysis' / 'usdc_pairs_latest.json'
 ANALYZER = ROOT / 'analyze_usdc_pairs.py'

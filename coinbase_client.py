@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Minimal Coinbase Advanced Trade REST client.
+Minimal Coinbase Advanced Trade REST client for Hermes/Umbrel.
 
 Security defaults:
 - Reads credentials only from environment variables or a local .env file.
@@ -10,7 +10,7 @@ Security defaults:
 
 Required env vars:
   COINBASE_API_KEY_NAME=organizations/.../apiKeys/...
-  COINBASE_API_PRIVATE_KEY='PASTE_YOUR_COINBASE_PEM_PRIVATE_KEY_WITH_ESCAPED_NEWLINES'
+  COINBASE_API_PRIVATE_KEY='PASTE_YOUR_COINBASE_PEM_WITH_ESCAPED_NEWLINES'
 """
 
 import argparse
