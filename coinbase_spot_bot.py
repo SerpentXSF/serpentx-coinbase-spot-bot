@@ -68,6 +68,67 @@ def save_json(path: Path, data: dict[str, Any]) -> None:
     tmp.replace(path)
 
 
+def _provider_budget_path(cfg: dict[str, Any] | None = None) -> Path:
+    cfg = cfg or {}
+    return Path(cfg.get("provider_budget_path") or os.getenv("PROVIDER_BUDGET_PATH") or (ROOT / "state" / "provider_budget.json"))
+
+
+def _provider_state(cfg: dict[str, Any], provider: str) -> tuple[dict[str, Any], Path, dict[str, Any]]:
+    path = _provider_budget_path(cfg)
+    try:
+        data = json.loads(path.read_text()) if path.exists() else {"providers": {}}
+        if not isinstance(data, dict):
+            data = {"providers": {}}
+    except Exception:
+        data = {"providers": {}}
+    providers = data.setdefault("providers", {})
+    state = providers.setdefault(provider, {})
+    return state, path, data
+
+
+def _save_provider_state(path: Path, data: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    data["updated_at"] = time.time()
+    tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+    tmp.replace(path)
+
+
+def _provider_can_request(cfg: dict[str, Any], provider: str) -> tuple[bool, str]:
+    state, path, data = _provider_state(cfg, provider)
+    now = time.time()
+    cooldown_until = float(state.get("cooldown_until") or 0)
+    if cooldown_until > now:
+        return False, "cooldown"
+    min_interval = float(cfg.get("provider_min_interval_seconds", {}).get(provider, 1.0)) if isinstance(cfg.get("provider_min_interval_seconds"), dict) else 1.0
+    last_request = float(state.get("last_request_at") or 0)
+    if (last_request + min_interval) > now:
+        return False, "min_interval"
+    state["last_request_at"] = now
+    _save_provider_state(path, data)
+    return True, ""
+
+
+def _provider_record(cfg: dict[str, Any], provider: str, *, ok: bool, status_code: int | None = None, error: str = "") -> None:
+    state, path, data = _provider_state(cfg, provider)
+    now = time.time()
+    if ok:
+        state["last_success_at"] = now
+        state["success_count"] = int(state.get("success_count") or 0) + 1
+        state["consecutive_errors"] = 0
+    else:
+        state["last_error_at"] = now
+        state["error_count"] = int(state.get("error_count") or 0) + 1
+        state["consecutive_errors"] = int(state.get("consecutive_errors") or 0) + 1
+        if status_code is not None:
+            state["last_status_code"] = int(status_code)
+        if error:
+            state["last_error"] = str(error)[:80]
+        if status_code == 429 or "rate" in error.lower() or "quota" in error.lower() or state["consecutive_errors"] >= 3:
+            state["cooldown_until"] = now + float(cfg.get("provider_cooldown_seconds", 300))
+    _save_provider_state(path, data)
+
+
 def append_jsonl(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a") as f:
@@ -333,11 +394,21 @@ def _get_json_cached(cfg: dict[str, Any], cache: dict[str, Any], key: str, url: 
     if isinstance(cached, dict) and _fresh(cached.get("fetched_at"), ttl):
         return {**cached, "cached": True}
     out: dict[str, Any] = {"provider": provider, "fetched_at": utcnow().isoformat()}
+    allowed, reason = _provider_can_request(cfg, provider)
+    if not allowed:
+        out.update({"error": f"provider_backoff:{reason}"})
+        return out
     try:
         r = requests.get(url, params=params, timeout=20, headers=_market_headers(provider))
-        r.raise_for_status()
-        out["data"] = r.json()
+        if r.status_code == 429:
+            _provider_record(cfg, provider, ok=False, status_code=429, error="rate_limited")
+            out["error"] = "rate_limited"
+        else:
+            r.raise_for_status()
+            out["data"] = r.json()
+            _provider_record(cfg, provider, ok=True, status_code=r.status_code)
     except Exception as e:
+        _provider_record(cfg, provider, ok=False, error=type(e).__name__)
         out["error"] = str(e)[:200]
     cache[key] = out
     return out
@@ -358,18 +429,28 @@ def fetch_market_context(cfg: dict[str, Any], product_id: str, cache: dict[str, 
             market = cached
         else:
             market = {"provider": "coingecko_markets", "fetched_at": utcnow().isoformat()}
-            try:
-                r = requests.get(
-                    "https://api.coingecko.com/api/v3/coins/markets",
-                    params={"vs_currency": "usd", "ids": cg_id, "price_change_percentage": "24h,7d"},
-                    timeout=20,
-                    headers=_market_headers("coingecko_markets"),
-                )
-                r.raise_for_status()
-                rows = r.json()
-                market["data"] = rows[0] if rows else {}
-            except Exception as e:
-                market["error"] = str(e)[:200]
+            allowed, reason = _provider_can_request(cfg, "coingecko_markets")
+            if not allowed:
+                market["error"] = f"provider_backoff:{reason}"
+            else:
+                try:
+                    r = requests.get(
+                        "https://api.coingecko.com/api/v3/coins/markets",
+                        params={"vs_currency": "usd", "ids": cg_id, "price_change_percentage": "24h,7d"},
+                        timeout=20,
+                        headers=_market_headers("coingecko_markets"),
+                    )
+                    if r.status_code == 429:
+                        _provider_record(cfg, "coingecko_markets", ok=False, status_code=429, error="rate_limited")
+                        market["error"] = "rate_limited"
+                    else:
+                        r.raise_for_status()
+                        rows = r.json()
+                        market["data"] = rows[0] if rows else {}
+                        _provider_record(cfg, "coingecko_markets", ok=True, status_code=r.status_code)
+                except Exception as e:
+                    _provider_record(cfg, "coingecko_markets", ok=False, error=type(e).__name__)
+                    market["error"] = str(e)[:200]
             cache[key] = market
         row = market.get("data") or {}
         if row:
@@ -558,24 +639,42 @@ def whale_context(cfg: dict[str, Any], product_id: str, cache: dict[str, Any]) -
         out.update({"provider": "not_applicable", "reasons": ["no Solana mint configured for this product; neutral"]})
         cache[key] = out
         return out
-    endpoint = os.getenv("HELIUS_RPC_URL") or os.getenv("HELIUS_GATEKEEPER_RPC_URL")
+    endpoint = (
+        os.getenv("HELIUS_RPC_URL")
+        or os.getenv("HELIUS_GATEKEEPER_RPC_URL")
+        or os.getenv("QUICKNODE_SOLANA_RPC_URL")
+        or os.getenv("SOLANA_RPC_URL")
+    )
+    provider = "helius_rpc" if (os.getenv("HELIUS_RPC_URL") or os.getenv("HELIUS_GATEKEEPER_RPC_URL")) else "quicknode_rpc"
     api_key = os.getenv("HELIUS_API_KEY")
     if not endpoint and api_key:
         endpoint = f"https://mainnet.helius-rpc.com/?api-key={api_key}"
+        provider = "helius_rpc"
     if not endpoint:
-        out.update({"provider": "helius_missing_key", "reasons": ["Helius RPC URL/API key not configured; neutral"]})
+        out.update({"provider": "solana_rpc_missing", "reasons": ["Solana RPC URL/API key not configured; neutral"]})
         cache[key] = out
         return out
     try:
+        allowed, reason = _provider_can_request(cfg, provider)
+        if not allowed:
+            out.update({"provider": provider, "score": 0, "error": f"provider_backoff:{reason}", "reasons": ["whale data provider cooling down; neutral"]})
+            cache[key] = out
+            return out
         body = {"jsonrpc": "2.0", "id": "serpentx-context", "method": "getSignaturesForAddress", "params": [mint, {"limit": int(whale_cfg.get("helius_signature_limit", 20))}]}
         r = requests.post(endpoint, json=body, timeout=20)
-        r.raise_for_status()
-        data = r.json()
-        sigs = data.get("result") or []
-        recent_errs = sum(1 for x in sigs if x.get("err"))
-        # Conservative: token-account activity alone is not proof of whale accumulation/distribution.
-        out.update({"score": 0, "recent_signature_count": len(sigs), "recent_error_count": recent_errs, "reasons": ["Solana mint activity checked; no exchange-flow classifier yet"]})
+        if r.status_code == 429:
+            _provider_record(cfg, provider, ok=False, status_code=429, error="rate_limited")
+            out.update({"provider": provider, "score": 0, "error": "rate_limited", "reasons": ["whale data rate-limited; neutral"]})
+        else:
+            r.raise_for_status()
+            data = r.json()
+            _provider_record(cfg, provider, ok=True, status_code=r.status_code)
+            sigs = data.get("result") or []
+            recent_errs = sum(1 for x in sigs if x.get("err"))
+            # Conservative: token-account activity alone is not proof of whale accumulation/distribution.
+            out.update({"provider": provider, "score": 0, "recent_signature_count": len(sigs), "recent_error_count": recent_errs, "reasons": ["Solana mint activity checked; no exchange-flow classifier yet"]})
     except Exception as e:
+        _provider_record(cfg, provider, ok=False, error=type(e).__name__)
         out.update({"score": 0, "error": str(e)[:200], "reasons": ["whale data unavailable; neutral"]})
     cache[key] = out
     return out
