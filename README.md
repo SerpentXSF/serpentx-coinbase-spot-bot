@@ -152,6 +152,13 @@ cp .env.example .env
 chmod 600 .env  # Linux/macOS
 ```
 
+On Windows PowerShell:
+
+```powershell
+copy config.example.json config.json
+copy .env.example .env
+```
+
 3. Edit `.env` and add your own Coinbase API credentials.
 
 ```text
