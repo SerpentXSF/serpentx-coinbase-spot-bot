@@ -82,6 +82,9 @@ def score_product(p):
     e9=ema(closes[-80:],9); e21=ema(closes[-100:],21); e50=ema(closes[-140:],50)
     t50=ema(tcloses[-140:],50); t20=ema(tcloses[-80:],20)
     rrsi=rsi(closes)
+    div=bot.rsi_divergence(exec_c, period=14, swing_window=2, lookback=80)
+    div_signal=div.get('signal','none')
+    div_label=div.get('label','None')
     # Volatility: average high-low pct over last 20 15m candles.
     ranges=[]
     for h,l,c in zip(highs[-20:], lows[-20:], closes[-20:]):
@@ -102,6 +105,10 @@ def score_product(p):
         cautions.append(f'RSI hot {rrsi:.1f}')
     elif rrsi<35 and px>t50:
         score+=1; reasons.append(f'trend pullback RSI {rrsi:.1f}')
+    if div_signal == 'bullish':
+        score += 1; reasons.append(div_label)
+    elif div_signal == 'bearish':
+        score -= 1; reasons.append(div_label)
     if chg>0:
         score+=1; reasons.append(f'24h positive {chg:.2f}%')
     elif chg < -8:
@@ -134,6 +141,10 @@ def score_product(p):
         short_score += 1; short_reasons.append(f'RSI downside/supportive {rrsi:.1f}')
     elif rrsi < 25:
         short_cautions.append(f'RSI oversold {rrsi:.1f}; snapback risk')
+    if div_signal == 'bearish':
+        short_score += 1; short_reasons.append(div_label)
+    elif div_signal == 'bullish':
+        short_score -= 1; short_cautions.append(div_label)
     if chg < 0:
         short_score += 1; short_reasons.append(f'24h negative {chg:.2f}%')
     elif chg > 12:
@@ -151,7 +162,7 @@ def score_product(p):
         score-=5; short_score-=5; cautions.append('trading disabled')
     directional_bias = 'LONG' if score >= short_score and score >= 5 else ('SHORT' if short_score >= 5 else 'NEUTRAL')
     action='BUY_WATCHLIST' if score>=5 else ('WATCH' if score>=3 else 'HOLD_USDC')
-    return {**base(p), 'score':score, 'long_score':score, 'short_score':short_score, 'directional_bias':directional_bias, 'action':action, 'price':px, 'change_24h':chg, 'volume_24h':vol24, 'quote_volume_24h_usdc': quote_vol, 'rsi':rrsi, 'ema9':e9, 'ema21':e21, 'ema50':e50, 'trend_ema20':t20, 'trend_ema50':t50, 'avg_15m_range_pct':avg_range*100, 'reasons':reasons, 'short_reasons':short_reasons, 'cautions':cautions, 'short_cautions':short_cautions, 'quote_min_size': quote_min}
+    return {**base(p), 'score':score, 'long_score':score, 'short_score':short_score, 'directional_bias':directional_bias, 'action':action, 'price':px, 'change_24h':chg, 'volume_24h':vol24, 'quote_volume_24h_usdc': quote_vol, 'rsi':rrsi, 'rsi_divergence':div, 'rsi_divergence_label':div_label, 'rsi_divergence_signal':div_signal, 'ema9':e9, 'ema21':e21, 'ema50':e50, 'trend_ema20':t20, 'trend_ema50':t50, 'avg_15m_range_pct':avg_range*100, 'reasons':reasons, 'short_reasons':short_reasons, 'cautions':cautions, 'short_cautions':short_cautions, 'quote_min_size': quote_min}
 
 def base(p):
     return {'product_id':p.get('product_id'), 'base_currency_id':p.get('base_currency_id') or p.get('base_name'), 'quote_currency_id':p.get('quote_currency_id'), 'trading_disabled':p.get('trading_disabled'), 'limit_only':p.get('limit_only'), 'cancel_only':p.get('cancel_only'), 'is_disabled':p.get('is_disabled'), 'status':p.get('status')}
@@ -204,5 +215,5 @@ def main():
     hist=OUTDIR/f'usdc_pairs_{stamp}.json'
     latest.write_text(json.dumps(out, indent=2, sort_keys=True))
     hist.write_text(json.dumps(out, indent=2, sort_keys=True))
-    print(json.dumps({'generated_at':out['generated_at'], 'total_products_seen':len(ps), 'usdc_pairs_analyzed':len(usdc), 'top5':[{k:r[k] for k in ['product_id','score','long_score','short_score','directional_bias','action','price','change_24h','quote_volume_24h_usdc','rsi','avg_15m_range_pct','reasons','short_reasons','cautions','short_cautions'] if k in r} for r in rows[:5]], 'top5_short_candidates':[{k:r[k] for k in ['product_id','score','long_score','short_score','directional_bias','action','price','change_24h','quote_volume_24h_usdc','rsi','avg_15m_range_pct','reasons','short_reasons','cautions','short_cautions'] if k in r} for r in short_rows[:5]], 'latest_path':str(latest)}, indent=2))
+    print(json.dumps({'generated_at':out['generated_at'], 'total_products_seen':len(ps), 'usdc_pairs_analyzed':len(usdc), 'top5':[{k:r[k] for k in ['product_id','score','long_score','short_score','directional_bias','action','price','change_24h','quote_volume_24h_usdc','rsi','rsi_divergence_label','rsi_divergence_signal','avg_15m_range_pct','reasons','short_reasons','cautions','short_cautions'] if k in r} for r in rows[:5]], 'top5_short_candidates':[{k:r[k] for k in ['product_id','score','long_score','short_score','directional_bias','action','price','change_24h','quote_volume_24h_usdc','rsi','rsi_divergence_label','rsi_divergence_signal','avg_15m_range_pct','reasons','short_reasons','cautions','short_cautions'] if k in r} for r in short_rows[:5]], 'latest_path':str(latest)}, indent=2))
 if __name__=='__main__': main()

@@ -21,7 +21,7 @@ Spot cannot create a true short position. Selling a spot asset you already hold 
 - `directional_bias`: `LONG`, `SHORT`, or `NEUTRAL`.
 - `top5_short_candidates`: saved in `analysis/usdc_pairs_latest.json`.
 
-`config.example.json` documents `directional_strategy` documenting the enabled dual-direction scoring model and the required gates for true shorting.
+`config.json` now includes `directional_strategy` documenting the enabled dual-direction scoring model and the required gates for true shorting.
 
 `rotate_and_run.py` now includes `top5_short_candidates` in cron summaries when it emits output.
 

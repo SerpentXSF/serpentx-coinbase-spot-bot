@@ -2,7 +2,7 @@
 """Coinbase Advanced Trade spot strategy bot for SerpentX/Hermes.
 
 Defaults are intentionally safe:
-- Loads credentials from a local .env file or environment.
+- Loads credentials from .env in the project directory or environment.
 - Public market analysis works without credentials.
 - Private account verification requires COINBASE_API_KEY_NAME and COINBASE_API_PRIVATE_KEY.
 - Live orders require all three gates: config active_trading=true, COINBASE_TRADING_ENABLED=1, and --live.
@@ -20,6 +20,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
+from decimal import Decimal, InvalidOperation, ROUND_DOWN
 from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
@@ -70,7 +71,7 @@ def save_json(path: Path, data: dict[str, Any]) -> None:
 
 def _provider_budget_path(cfg: dict[str, Any] | None = None) -> Path:
     cfg = cfg or {}
-    return Path(cfg.get("provider_budget_path") or os.getenv("PROVIDER_BUDGET_PATH") or (ROOT / "state" / "provider_budget.json"))
+    return Path(cfg.get("provider_budget_path") or (ROOT / "state" / "provider_budget.json"))
 
 
 def _provider_state(cfg: dict[str, Any], provider: str) -> tuple[dict[str, Any], Path, dict[str, Any]]:
@@ -283,6 +284,81 @@ def rsi(vals: list[float], period: int = 14) -> float:
     return 100 - (100 / (1 + rs))
 
 
+def _rsi_series(vals: list[float], period: int = 14) -> list[float | None]:
+    """Return simple rolling RSI values aligned to vals, using no paid APIs."""
+    out: list[float | None] = [None] * len(vals)
+    if len(vals) < period + 1:
+        return out
+    for i in range(period, len(vals)):
+        out[i] = rsi(vals[: i + 1], period)
+    return out
+
+
+def _swing_points(values: list[float], *, mode: str, window: int) -> list[int]:
+    idxs: list[int] = []
+    if window < 1 or len(values) < (window * 2 + 1):
+        return idxs
+    for i in range(window, len(values) - window):
+        segment = values[i - window : i + window + 1]
+        v = values[i]
+        if mode == "low":
+            if v == min(segment) and v < values[i - 1] and v <= values[i + 1]:
+                idxs.append(i)
+        else:
+            if v == max(segment) and v > values[i - 1] and v >= values[i + 1]:
+                idxs.append(i)
+    return idxs
+
+
+def rsi_divergence(candles: list[dict[str, Any]], period: int = 14, swing_window: int = 2, lookback: int = 80) -> dict[str, Any]:
+    """Detect classic RSI divergence from local candle closes.
+
+    Bullish Divergence: price makes a lower swing low while RSI makes a higher low.
+    Bearish Divergence: price makes a higher swing high while RSI makes a lower high.
+    This is a free/local technical metric; it uses only the candles already fetched
+    from Coinbase and never calls an extra provider.
+    """
+    closes = [fnum(c.get("close")) for c in candles if fnum(c.get("close")) > 0]
+    closes = closes[-lookback:]
+    neutral = {
+        "signal": "none",
+        "label": "None",
+        "previous_price": None,
+        "latest_price": None,
+        "previous_rsi": None,
+        "latest_rsi": None,
+        "previous_index": None,
+        "latest_index": None,
+    }
+    if len(closes) < max(period + 3, swing_window * 2 + 3):
+        return neutral
+    rsis = _rsi_series(closes, period)
+
+    def pair_payload(signal: str, label: str, a: int, b: int) -> dict[str, Any]:
+        return {
+            "signal": signal,
+            "label": label,
+            "previous_price": closes[a],
+            "latest_price": closes[b],
+            "previous_rsi": rsis[a],
+            "latest_rsi": rsis[b],
+            "previous_index": a,
+            "latest_index": b,
+        }
+
+    lows = [i for i in _swing_points(closes, mode="low", window=swing_window) if rsis[i] is not None]
+    highs = [i for i in _swing_points(closes, mode="high", window=swing_window) if rsis[i] is not None]
+    recent_lows = lows[-4:]
+    recent_highs = highs[-4:]
+    for a, b in zip(recent_lows, recent_lows[1:]):
+        if closes[b] < closes[a] and (rsis[b] or 0) > (rsis[a] or 0):
+            return pair_payload("bullish", "Bullish Divergence", a, b)
+    for a, b in zip(recent_highs, recent_highs[1:]):
+        if closes[b] > closes[a] and (rsis[b] or 0) < (rsis[a] or 0):
+            return pair_payload("bearish", "Bearish Divergence", a, b)
+    return neutral
+
+
 def fetch_candles(product_id: str, granularity: str, lookback_hours: int) -> list[dict[str, Any]]:
     end = int(time.time())
     start = end - lookback_hours * 3600
@@ -297,6 +373,46 @@ def fetch_candles(product_id: str, granularity: str, lookback_hours: int) -> lis
 
 def product_info(product_id: str) -> dict[str, Any]:
     return public_get(f"/api/v3/brokerage/market/products/{product_id}")
+
+
+def product_metadata(product_id: str, ttl_seconds: int = 86400) -> dict[str, Any]:
+    """Cached Coinbase product metadata for sizing/preflight checks.
+
+    Prices stay live via product_info(); this cache is only for relatively stable
+    order constraints such as base_increment, quote_increment, min sizes, and
+    orderability flags so we avoid spending an extra public API call on every
+    order preview/place.
+    """
+    cache_path = ROOT / "analysis" / "product_metadata_cache.json"
+    try:
+        cache = json.loads(cache_path.read_text()) if cache_path.exists() else {}
+    except Exception:
+        cache = {}
+    row = cache.get(product_id)
+    if isinstance(row, dict) and _fresh(row.get("fetched_at"), ttl_seconds):
+        return row.get("data", row)
+    info = product_info(product_id)
+    wanted = {
+        "product_id": info.get("product_id", product_id),
+        "base_increment": info.get("base_increment"),
+        "quote_increment": info.get("quote_increment"),
+        "base_min_size": info.get("base_min_size"),
+        "quote_min_size": info.get("quote_min_size"),
+        "trading_disabled": info.get("trading_disabled"),
+        "is_disabled": info.get("is_disabled"),
+        "cancel_only": info.get("cancel_only"),
+        "limit_only": info.get("limit_only"),
+        "status": info.get("status"),
+    }
+    cache[product_id] = {"fetched_at": utcnow().isoformat(), "data": wanted}
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = cache_path.with_suffix(cache_path.suffix + ".tmp")
+        tmp.write_text(json.dumps(cache, indent=2, sort_keys=True) + "\n")
+        tmp.replace(cache_path)
+    except Exception:
+        pass
+    return wanted
 
 
 def is_market_orderable_product(info: dict[str, Any]) -> bool:
@@ -513,17 +629,23 @@ def fetch_market_context(cfg: dict[str, Any], product_id: str, cache: dict[str, 
         except Exception:
             pass
 
-    # Market-wide fear/greed is a small risk modifier, cached globally.
+    # Market-wide fear/greed is a bounded contrarian modifier, cached globally.
+    # Extreme fear can create spot mean-reversion opportunities for already-qualified
+    # technical entries, while extreme greed is still treated as chase risk.
     fng = _get_json_cached(cfg, cache, "alternative:fear_greed", "https://api.alternative.me/fng/", {"limit": 1, "format": "json"}, ttl, "alternative_fear_greed")
     try:
         fg = int((fng.get("data", {}).get("data") or [{}])[0].get("value", 50))
         out["fear_greed"] = fg
-        if fg <= 20:
-            out["score"] -= 1; out["reasons"].append(f"market extreme fear {fg}")
+        fear_threshold = int(market_cfg.get("fear_extreme_threshold", 20))
+        greed_threshold = int(market_cfg.get("greed_extreme_threshold", 80))
+        fear_boost = int(market_cfg.get("fear_contrarian_boost", 1))
+        greed_penalty = int(market_cfg.get("greed_chase_penalty", 1))
+        if fg <= fear_threshold:
+            out["score"] += fear_boost; out["reasons"].append(f"market extreme fear {fg}; contrarian spot boost")
         elif 45 <= fg <= 75:
             out["reasons"].append(f"market sentiment acceptable {fg}")
-        elif fg >= 85:
-            out["score"] -= 1; out["reasons"].append(f"market extreme greed {fg}; chase risk")
+        elif fg >= greed_threshold:
+            out["score"] -= greed_penalty; out["reasons"].append(f"market extreme greed {fg}; chase risk")
     except Exception:
         pass
     out["score"] = max(-2, min(2, int(out["score"])))
@@ -690,7 +812,8 @@ def apply_context_scores(cfg: dict[str, Any], sig: "Signal", cache: dict[str, An
     social = social_context(cfg, sig.product_id, cache)
     whale = whale_context(cfg, sig.product_id, cache)
     context_total = int(news.get("score", 0)) + int(market.get("score", 0)) + int(social.get("score", 0)) + int(whale.get("score", 0))
-    risk_block = bool(news.get("risk_block") or market.get("risk_block") or social.get("risk_block") or whale.get("risk_block"))
+    existing_risk_block = bool(sig.risk_block)
+    risk_block = bool(existing_risk_block or news.get("risk_block") or market.get("risk_block") or social.get("risk_block") or whale.get("risk_block"))
     # Overheated/hype penalty: don't chase very extended daily moves when external context is weak/noisy.
     risk_penalty = 0
     penalty_reasons = []
@@ -723,6 +846,82 @@ class Signal:
     context_score: int = 0
     risk_block: bool = False
     context: dict[str, Any] = field(default_factory=dict)
+    avg_exec_range_pct: float = 0.0
+    five_minute_confirmed: bool | None = None
+    five_minute_reason: str | None = None
+    fee_guard: dict[str, Any] = field(default_factory=dict)
+    rsi_divergence: dict[str, Any] = field(default_factory=dict)
+    rsi_divergence_label: str = "None"
+    rsi_divergence_signal: str = "none"
+
+
+def _avg_range_pct(candles: list[dict[str, Any]], limit: int = 20) -> float:
+    ranges = []
+    for c in candles[-limit:]:
+        close = fnum(c.get("close"))
+        high = fnum(c.get("high"))
+        low = fnum(c.get("low"))
+        if close > 0 and high > 0 and low > 0:
+            ranges.append((high - low) / close)
+    return sum(ranges) / len(ranges) if ranges else 0.0
+
+
+def _apply_five_minute_confirmation(cfg: dict[str, Any], sig: Signal) -> Signal:
+    if not cfg.get("five_minute_confirmation_enabled", False):
+        return sig
+    lookback = int(cfg.get("five_minute_confirmation_lookback_hours", 8))
+    min_closes = int(cfg.get("five_minute_confirmation_min_candles", 24))
+    candles = fetch_candles(sig.product_id, "FIVE_MINUTE", lookback)
+    closes = [fnum(c.get("close")) for c in candles if fnum(c.get("close")) > 0]
+    if len(closes) < min_closes:
+        sig.five_minute_confirmed = False
+        sig.five_minute_reason = "insufficient 5m candle history"
+        sig.risk_block = True
+        sig.action = "HOLD_USDC"
+        sig.reasons.append(sig.five_minute_reason)
+        return sig
+    ema9_5m = ema(closes[-60:], 9)
+    ema21_5m = ema(closes[-80:], 21)
+    latest = closes[-1]
+    prior = closes[-2] if len(closes) >= 2 else latest
+    if latest >= ema21_5m and ema9_5m >= ema21_5m and latest >= prior:
+        sig.five_minute_confirmed = True
+        sig.five_minute_reason = "5m confirmation bullish/steady"
+        sig.reasons.append(sig.five_minute_reason)
+    else:
+        sig.five_minute_confirmed = False
+        sig.five_minute_reason = "5m confirmation failed; avoiding weak immediate entry"
+        sig.risk_block = True
+        sig.action = "HOLD_USDC"
+        sig.reasons.append(sig.five_minute_reason)
+    return sig
+
+
+def _apply_fee_guard(cfg: dict[str, Any], sig: Signal) -> Signal:
+    if not cfg.get("fee_aware_entry_enabled", False):
+        return sig
+    roundtrip = float(cfg.get("fee_tracking", {}).get("estimated_roundtrip_fee_pct", cfg.get("estimated_roundtrip_fee_pct", 0.0)))
+    min_net = float(cfg.get("minimum_net_edge_pct", 0.0))
+    required = roundtrip + min_net
+    target = float(cfg.get("take_profit_pct", 0.0))
+    range_mult = float(cfg.get("expected_move_range_multiplier", 4.0))
+    volatility_estimate = sig.avg_exec_range_pct * range_mult
+    expected_move = max(target, volatility_estimate)
+    sig.fee_guard = {
+        "estimated_roundtrip_fee_pct": roundtrip,
+        "minimum_net_edge_pct": min_net,
+        "required_gross_move_pct": required,
+        "take_profit_pct": target,
+        "avg_exec_range_pct": sig.avg_exec_range_pct,
+        "expected_move_pct": expected_move,
+    }
+    if expected_move < required or target < required:
+        sig.risk_block = True
+        sig.action = "HOLD_USDC"
+        sig.reasons.append(f"fee guard blocked: expected/target move below {required*100:.2f}% gross requirement")
+    else:
+        sig.reasons.append(f"fee guard ok: target {target*100:.2f}% vs gross requirement {required*100:.2f}%")
+    return sig
 
 
 def score_product(cfg: dict[str, Any], product_id: str) -> Signal:
@@ -736,13 +935,20 @@ def score_product(cfg: dict[str, Any], product_id: str) -> Signal:
     closes = [fnum(c.get("close")) for c in exec_c if fnum(c.get("close")) > 0]
     trend_closes = [fnum(c.get("close")) for c in trend_c if fnum(c.get("close")) > 0]
     price = fnum(info.get("price"), closes[-1] if closes else 0)
+    avg_exec_range = _avg_range_pct(exec_c)
     if len(closes) < 30 or len(trend_closes) < 20 or price <= 0:
-        return Signal(product_id, price, 0, "HOLD", ["insufficient candle history"], 50, fnum(info.get("price_percentage_change_24h")), fnum(info.get("volume_24h")))
+        return Signal(product_id, price, 0, "HOLD", ["insufficient candle history"], 50, fnum(info.get("price_percentage_change_24h")), fnum(info.get("volume_24h")), avg_exec_range_pct=avg_exec_range)
     ema9 = ema(closes[-60:], 9)
     ema21 = ema(closes[-80:], 21)
     ema50 = ema(closes[-120:], 50)
     trend50 = ema(trend_closes[-120:], 50)
     cur_rsi = rsi(closes, 14)
+    divergence = rsi_divergence(
+        exec_c,
+        period=int(cfg.get("rsi_divergence_period", 14)),
+        swing_window=int(cfg.get("rsi_divergence_swing_window", 2)),
+        lookback=int(cfg.get("rsi_divergence_lookback_candles", 80)),
+    )
     chg = fnum(info.get("price_percentage_change_24h"))
     vol = fnum(info.get("volume_24h"))
     score = 0
@@ -757,12 +963,29 @@ def score_product(cfg: dict[str, Any], product_id: str) -> Signal:
         score += 1; reasons.append(f"RSI supportive {cur_rsi:.1f}")
     elif cur_rsi < 35 and price > trend50:
         score += 1; reasons.append(f"trend pullback RSI {cur_rsi:.1f}")
+    div_signal = divergence.get("signal", "none")
+    div_label = divergence.get("label", "None")
+    if div_signal == "bullish":
+        score += int(cfg.get("rsi_bullish_divergence_score", 1))
+        reasons.append(div_label)
+    elif div_signal == "bearish":
+        score -= int(cfg.get("rsi_bearish_divergence_penalty", 1))
+        reasons.append(div_label)
     if chg > 0:
         score += 1; reasons.append(f"24h green {chg:.2f}%")
     if vol > 0:
         score += 1; reasons.append("active volume")
+    if avg_exec_range >= float(cfg.get("min_avg_exec_range_pct", 0.0)):
+        reasons.append(f"avg exec range {avg_exec_range*100:.2f}%")
     action = "BUY" if score >= int(cfg["score_threshold"]) else "HOLD_USDC"
-    return Signal(product_id, price, score, action, reasons, cur_rsi, chg, vol)
+    sig = Signal(product_id, price, score, action, reasons, cur_rsi, chg, vol, avg_exec_range_pct=avg_exec_range)
+    sig.rsi_divergence = divergence
+    sig.rsi_divergence_label = div_label
+    sig.rsi_divergence_signal = div_signal
+    if sig.action == "BUY":
+        sig = _apply_five_minute_confirmation(cfg, sig)
+        sig = _apply_fee_guard(cfg, sig)
+    return sig
 
 
 def get_accounts() -> dict[str, Any]:
@@ -781,23 +1004,68 @@ def balance_map(accounts: dict[str, Any]) -> dict[str, float]:
     return out
 
 
-def preview_market(product_id: str, side: str, quote_size: float | None = None, base_size: float | None = None) -> dict[str, Any]:
+def _decimal_from(value: Any) -> Decimal:
+    try:
+        return Decimal(str(value))
+    except (InvalidOperation, ValueError) as exc:
+        raise RuntimeError(f"Invalid order size: {value!r}") from exc
+
+
+def _format_decimal(d: Decimal) -> str:
+    # Coinbase rejects scientific notation and excess trailing zeros in order sizes.
+    s = format(d.normalize(), "f")
+    if "." in s:
+        s = s.rstrip("0").rstrip(".")
+    return s or "0"
+
+
+def quantize_order_size(product_id: str, field: str, size: float | str | Decimal) -> str:
+    """Floor order size to Coinbase product increment to avoid precision rejects.
+
+    Coinbase product metadata defines base_increment/quote_increment per market.
+    Using a blanket round(..., 8) can over-specify products like NEAR-USDC
+    (base_increment=0.001), causing PREVIEW_INVALID_SIZE_PRECISION on sells.
+    """
+    info = product_metadata(product_id)
+    inc_key = "quote_increment" if field == "quote_size" else "base_increment"
+    min_key = "quote_min_size" if field == "quote_size" else "base_min_size"
+    inc = _decimal_from(info.get(inc_key) or "0.00000001")
+    raw = _decimal_from(size)
+    if raw <= 0:
+        return "0"
+    if inc <= 0:
+        return _format_decimal(raw)
+    quantized = (raw / inc).to_integral_value(rounding=ROUND_DOWN) * inc
+    min_size = _decimal_from(info.get(min_key) or "0")
+    if min_size > 0 and quantized < min_size:
+        return "0"
+    return _format_decimal(quantized)
+
+
+def market_order_config(product_id: str, quote_size: float | None = None, base_size: float | None = None) -> dict[str, Any]:
+    info = product_metadata(product_id)
+    if not is_market_orderable_product(info):
+        raise RuntimeError(f"{product_id} is not market-orderable")
     if quote_size is not None:
-        oc = {"market_market_ioc": {"quote_size": str(round(quote_size, 8))}}
-    elif base_size is not None:
-        oc = {"market_market_ioc": {"base_size": str(round(base_size, 8))}}
-    else:
-        raise RuntimeError("quote_size or base_size required")
+        q = quantize_order_size(product_id, "quote_size", quote_size)
+        if _decimal_from(q) <= 0:
+            raise RuntimeError(f"{product_id} quote_size is below Coinbase minimum after quantization")
+        return {"market_market_ioc": {"quote_size": q}}
+    if base_size is not None:
+        b = quantize_order_size(product_id, "base_size", base_size)
+        if _decimal_from(b) <= 0:
+            raise RuntimeError(f"{product_id} base_size is below Coinbase minimum after quantization")
+        return {"market_market_ioc": {"base_size": b}}
+    raise RuntimeError("quote_size or base_size required")
+
+
+def preview_market(product_id: str, side: str, quote_size: float | None = None, base_size: float | None = None) -> dict[str, Any]:
+    oc = market_order_config(product_id, quote_size=quote_size, base_size=base_size)
     return private_request("POST", "/api/v3/brokerage/orders/preview", {"product_id": product_id, "side": side.upper(), "order_configuration": oc})
 
 
 def place_market(product_id: str, side: str, quote_size: float | None = None, base_size: float | None = None) -> dict[str, Any]:
-    if quote_size is not None:
-        oc = {"market_market_ioc": {"quote_size": str(round(quote_size, 8))}}
-    elif base_size is not None:
-        oc = {"market_market_ioc": {"base_size": str(round(base_size, 8))}}
-    else:
-        raise RuntimeError("quote_size or base_size required")
+    oc = market_order_config(product_id, quote_size=quote_size, base_size=base_size)
     body = {"client_order_id": str(uuid.uuid4()), "product_id": product_id, "side": side.upper(), "order_configuration": oc}
     return private_request("POST", "/api/v3/brokerage/orders", body)
 
@@ -816,26 +1084,42 @@ def count_daily_trades(path: Path, now: datetime | None = None) -> int:
             continue
         if ts.tzinfo is None:
             ts = ts.replace(tzinfo=timezone.utc)
-        if (now - ts).total_seconds() <= 86400:
+        if (now - ts).total_seconds() <= 86400 and row.get("order", {}).get("success") is True:
             count += 1
     return count
 
 
 def dynamic_quote_size(cfg: dict[str, Any], quote_bal: float, top: Signal) -> float:
-    """Size between min/max quote based on available balance and asset risk."""
+    """Risk-adjusted BUY size for a small target bankroll.
+
+    Only the configured target bankroll participates in sizing, so extra USDC can
+    sit in the account for separate experiments without increasing this bot's spot
+    exposure. Within that target, stronger final scores can scale above the base
+    percent cap, while threshold-only, thin-liquidity, or overheated names are kept
+    at the minimum ticket size.
+    """
     min_q = float(cfg.get("min_quote_per_trade", cfg.get("min_quote_balance_to_trade", 15)))
     max_q = float(cfg.get("max_quote_per_trade", 20))
-    pct_cap = quote_bal * float(cfg["max_account_quote_pct_per_trade"])
-    size = max_q
+    target_bal = float(cfg.get("sizing_quote_balance_target", cfg.get("trading_quote_balance_target", quote_bal)) or quote_bal)
+    sizing_bal = max(0.0, min(quote_bal, target_bal))
+    pct_cap = sizing_bal * float(cfg["max_account_quote_pct_per_trade"])
     effective_score = int(getattr(top, "final_score", 0) or top.score)
     threshold = int(cfg.get("final_score_threshold", cfg["score_threshold"]))
+    score_edge = max(0, effective_score - threshold)
+    step_multiplier = float(cfg.get("sizing_score_step_multiplier", 0.15))
+    max_multiplier = float(cfg.get("sizing_max_score_multiplier", 1.35))
+    multiplier = min(max_multiplier, 1.0 + (score_edge * step_multiplier))
+    size = pct_cap * multiplier
+    thin_volume = float(cfg.get("sizing_thin_volume_quote_usdc", 1_000_000))
     if effective_score <= threshold:
         size = min(size, min_q)
-    if top.quote_volume < 1_000_000:
+    if top.quote_volume < thin_volume:
         size = min(size, min_q)
     if top.change_24h > float(cfg.get("overheated_size_down_pct", 20)) or top.change_24h < -10:
         size = min(size, min_q)
-    size = min(size, pct_cap, quote_bal)
+    size = min(size, max_q, quote_bal)
+    if size < min_q:
+        return 0.0
     return max(0.0, math.floor(size * 100) / 100)
 
 
@@ -850,10 +1134,34 @@ def live_gates_open(cfg: dict[str, Any], live: bool) -> str | None:
 
 
 def normalize_positions(state: dict[str, Any]) -> list[dict[str, Any]]:
-    """Return bot-managed positions, migrating legacy single-position state."""
+    """Return bot-managed positions, migrating legacy single-position state.
+
+    State has historically moved from a single ``open_position`` object to an
+    ``open_positions`` list.  Keep this normalizer defensive: drop malformed
+    rows and collapse exact duplicate product/open-time entries so stale state
+    cannot block new entries or cause duplicate exit attempts for the same
+    bot-managed fill.
+    """
     positions = state.get("open_positions")
     if isinstance(positions, list):
-        return [p for p in positions if isinstance(p, dict) and p.get("product_id")]
+        cleaned: list[dict[str, Any]] = []
+        seen: set[tuple[str, str, str]] = set()
+        for p in positions:
+            if not isinstance(p, dict) or not p.get("product_id"):
+                continue
+            key = (
+                str(p.get("product_id")),
+                str(p.get("opened_at", "")),
+                str(p.get("entry_price", "")),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            cleaned.append(p)
+        if cleaned != positions:
+            state["open_positions"] = cleaned
+            state.pop("open_position", None)
+        return cleaned
     legacy = state.get("open_position")
     if isinstance(legacy, dict) and legacy.get("product_id"):
         state["open_positions"] = [legacy]
@@ -1034,15 +1342,20 @@ def run(cfg: dict[str, Any], *, status: bool=False, live: bool=False) -> dict[st
                     updated_positions.append(pos)
                 else:
                     order = place_market(pos_product, "SELL", base_size=base_size)
-                    result["decision"] = "ORDER_SENT"
                     result["order"] = order
-                    state["cooldown_until"] = (utcnow() + timedelta(minutes=float(cfg["cooldown_minutes_after_trade"]))).isoformat()
-                    if sell_reason in {"STOP_LOSS", "SOFT_INVALIDATION", "TRAILING_STOP"}:
-                        set_product_cooldown(state, pos_product, float(cfg.get("per_product_cooldown_minutes_after_stop", 720)))
+                    if order.get("success") is True:
+                        result["decision"] = "ORDER_SENT"
+                        state["cooldown_until"] = (utcnow() + timedelta(minutes=float(cfg["cooldown_minutes_after_trade"]))).isoformat()
+                        if sell_reason in {"STOP_LOSS", "SOFT_INVALIDATION", "TRAILING_STOP"}:
+                            set_product_cooldown(state, pos_product, float(cfg.get("per_product_cooldown_minutes_after_stop", 720)))
+                        else:
+                            set_product_cooldown(state, pos_product, float(cfg.get("per_product_cooldown_minutes_after_trade", 180)))
+                        append_jsonl(Path(cfg["trades_log_path"]), {"ts": result["ts"], "side": "SELL", "reason": sell_reason, "order": order, "position": pos})
+                        updated_positions.extend(p for p in positions if p is not pos)
                     else:
-                        set_product_cooldown(state, pos_product, float(cfg.get("per_product_cooldown_minutes_after_trade", 180)))
-                    append_jsonl(Path(cfg["trades_log_path"]), {"ts": result["ts"], "side": "SELL", "reason": sell_reason, "order": order, "position": pos})
-                updated_positions.extend(p for p in positions if p is not pos)
+                        result["decision"] = "ORDER_FAILED"
+                        updated_positions.append(pos)
+                        append_jsonl(Path(cfg["trades_log_path"]), {"ts": result["ts"], "side": "SELL", "reason": sell_reason, "order": order, "position": pos, "failed": True})
                 persist_positions(state, updated_positions)
                 break
             updated_positions.append(pos)
@@ -1084,20 +1397,24 @@ def run(cfg: dict[str, Any], *, status: bool=False, live: bool=False) -> dict[st
                     result["decision"] = gate
                 else:
                     order = place_market(entry_signal.product_id, "BUY", quote_size=quote_size)
-                    result["decision"] = "ORDER_SENT"
                     result["order"] = order
-                    state["cooldown_until"] = (utcnow() + timedelta(minutes=float(cfg["cooldown_minutes_after_trade"]))).isoformat()
-                    positions.append({
-                        "product_id": entry_signal.product_id,
-                        "entry_price": entry_signal.price,
-                        "quote_size": quote_size,
-                        "base_size_est": quote_size / entry_signal.price if entry_signal.price > 0 else 0.0,
-                        "opened_at": result["ts"],
-                        "high_water_price": entry_signal.price,
-                        "high_water_pnl_pct": 0.0,
-                    })
-                    persist_positions(state, positions)
-                    append_jsonl(Path(cfg["trades_log_path"]), {"ts": result["ts"], "side": "BUY", "order": order, "signal": entry_signal.__dict__, "quote_size": quote_size})
+                    if order.get("success") is True:
+                        result["decision"] = "ORDER_SENT"
+                        state["cooldown_until"] = (utcnow() + timedelta(minutes=float(cfg["cooldown_minutes_after_trade"]))).isoformat()
+                        positions.append({
+                            "product_id": entry_signal.product_id,
+                            "entry_price": entry_signal.price,
+                            "quote_size": quote_size,
+                            "base_size_est": quote_size / entry_signal.price if entry_signal.price > 0 else 0.0,
+                            "opened_at": result["ts"],
+                            "high_water_price": entry_signal.price,
+                            "high_water_pnl_pct": 0.0,
+                        })
+                        persist_positions(state, positions)
+                        append_jsonl(Path(cfg["trades_log_path"]), {"ts": result["ts"], "side": "BUY", "order": order, "signal": entry_signal.__dict__, "quote_size": quote_size})
+                    else:
+                        result["decision"] = "ORDER_FAILED"
+                        append_jsonl(Path(cfg["trades_log_path"]), {"ts": result["ts"], "side": "BUY", "order": order, "signal": entry_signal.__dict__, "quote_size": quote_size, "failed": True})
 
     if not (status and result.get("open_positions")):
         result["open_positions"] = normalize_positions(state)

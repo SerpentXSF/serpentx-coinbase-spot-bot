@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.4.0-beta
+
+- Added RSI divergence labels and scoring adjustments for bullish/bearish divergence.
+- Added 5-minute entry confirmation and fee-aware entry guards to reduce weak/immediate entries.
+- Added dynamic sizing knobs, target-bankroll sizing, overheated-entry controls, and optional trailing stop support.
+- Added defensive stale duplicate-position cleanup in bot-managed state.
+- Added low-call `reconcile_orders.py` to verify recent locally logged Coinbase orders against Coinbase historical order status.
+- Updated dashboard documentation for the Red/Purple responsive analytics UI, snapshots, order reconciliation, and candidate forward-return data.
+- Expanded README installation instructions for Linux/macOS/WSL and Windows PowerShell.
+
 ## v0.3.0-beta
 
 - Added a local, read-only performance dashboard for reviewing bot state, run logs, and trade history.

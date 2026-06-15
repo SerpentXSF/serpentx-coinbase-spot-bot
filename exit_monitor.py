@@ -165,22 +165,35 @@ def run(*, live: bool = False, json_status: bool = False) -> dict[str, Any]:
                 updated_positions.append(pos)
             else:
                 order = bot.place_market(product_id, "SELL", base_size=base_size)
-                result["decision"] = "ORDER_SENT"
                 result["order"] = order
-                state["cooldown_until"] = (bot.utcnow() + timedelta(minutes=float(cfg["cooldown_minutes_after_trade"]))).isoformat()
-                if sell_reason in {"STOP_LOSS", "SOFT_INVALIDATION", "TRAILING_STOP"}:
-                    _set_product_cooldown(state, product_id, float(cfg.get("per_product_cooldown_minutes_after_stop", 720)))
+                if order.get("success") is True:
+                    result["decision"] = "ORDER_SENT"
+                    state["cooldown_until"] = (bot.utcnow() + timedelta(minutes=float(cfg["cooldown_minutes_after_trade"]))).isoformat()
+                    if sell_reason in {"STOP_LOSS", "SOFT_INVALIDATION", "TRAILING_STOP"}:
+                        _set_product_cooldown(state, product_id, float(cfg.get("per_product_cooldown_minutes_after_stop", 720)))
+                    else:
+                        _set_product_cooldown(state, product_id, float(cfg.get("per_product_cooldown_minutes_after_trade", 180)))
+                    bot.append_jsonl(Path(cfg["trades_log_path"]), {
+                        "ts": result["ts"],
+                        "side": "SELL",
+                        "reason": sell_reason,
+                        "order": order,
+                        "position": pos,
+                        "source": "exit_monitor",
+                    })
+                    updated_positions.extend(p for p in positions if p is not pos)
                 else:
-                    _set_product_cooldown(state, product_id, float(cfg.get("per_product_cooldown_minutes_after_trade", 180)))
-                bot.append_jsonl(Path(cfg["trades_log_path"]), {
-                    "ts": result["ts"],
-                    "side": "SELL",
-                    "reason": sell_reason,
-                    "order": order,
-                    "position": pos,
-                    "source": "exit_monitor",
-                })
-            updated_positions.extend(p for p in positions if p is not pos)
+                    result["decision"] = "ORDER_FAILED"
+                    bot.append_jsonl(Path(cfg["trades_log_path"]), {
+                        "ts": result["ts"],
+                        "side": "SELL",
+                        "reason": sell_reason,
+                        "order": order,
+                        "position": pos,
+                        "source": "exit_monitor",
+                        "failed": True,
+                    })
+                    updated_positions.append(pos)
             bot.persist_positions(state, updated_positions)
             break
 

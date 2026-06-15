@@ -1,6 +1,6 @@
 # SerpentX Coinbase USDC Spot Bot
 
-Current version: **v0.3.0-beta**
+Current version: **v0.4.0-beta**
 
 Educational Coinbase Advanced Trade **spot** bot for scanning USDC crypto pairs, rotating a watchlist, and managing risk-gated market orders.
 
@@ -15,6 +15,8 @@ Educational Coinbase Advanced Trade **spot** bot for scanning USDC crypto pairs,
 - Tracks bot-managed open positions in local state.
 - Exits positions with take-profit, stop-loss, or soft-invalidation logic.
 - Includes a lightweight exit monitor that can run more often than the full market scanner.
+- Includes RSI bullish/bearish divergence labels, 5-minute entry confirmation, fee-aware entry guards, trailing-stop support, and stale duplicate-position cleanup.
+- Includes a local Red/Purple analytics dashboard with responsive cards, charts, snapshots, order reconciliation, and candidate follow-through metrics.
 - Defaults to preview mode; live orders require multiple explicit gates.
 
 ## Not required
@@ -83,25 +85,59 @@ Additional protections include:
 - API key with trading permission only if you intend to trade live
 - **No withdrawal/transfer permission** recommended
 
-Install dependencies:
+## Install on Linux / macOS / WSL
 
 ```bash
-python -m venv .venv
+git clone https://github.com/SerpentXSF/serpentx-coinbase-spot-bot.git
+cd serpentx-coinbase-spot-bot
+python3 -m venv .venv
 source .venv/bin/activate
+python -m pip install --upgrade pip
 pip install -r requirements.txt
+cp config.example.json config.json
+cp .env.example .env
+chmod 600 .env
 ```
 
-On Windows PowerShell:
+If your distro blocks system `pip` with PEP 668, keep using the virtual environment above, or install with `uv`:
+
+```bash
+uv venv .venv
+uv pip install --python .venv/bin/python -r requirements.txt
+```
+
+## Install on Windows PowerShell
 
 ```powershell
-python -m venv .venv
+git clone https://github.com/SerpentXSF/serpentx-coinbase-spot-bot.git
+cd serpentx-coinbase-spot-bot
+py -3 -m venv .venv
 .\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
 pip install -r requirements.txt
+Copy-Item config.example.json config.json
+Copy-Item .env.example .env
+```
+
+If PowerShell blocks activation scripts, run:
+
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+```
+
+Then reopen PowerShell and activate the venv again. Windows users can also run the Linux instructions inside WSL.
+
+## Generic dependency install
+
+If you already cloned the repo and created `config.json` / `.env`, install dependencies with:
+
+```bash
+python -m pip install -r requirements.txt
 ```
 
 ## Setup
 
-1. Clone the repository.
+1. Clone the repository if you did not already do so.
 
 ```bash
 git clone https://github.com/SerpentXSF/serpentx-coinbase-spot-bot.git
@@ -180,7 +216,7 @@ The monitor stays quiet on normal hold/no-position ticks unless `--json` is supp
 
 ### Local performance dashboard
 
-Run a local, read-only dashboard from your own bot state/log files:
+Run a local, read-only dashboard from your own bot state/log files. The dashboard includes responsive dark Red/Purple styling, balances/position cards, SVG charts, recent run/trade tables, candidate snapshots, forward-return summaries, and optional order reconciliation data.
 
 ```bash
 python trade_analytics_dashboard.py --host 127.0.0.1 --port 8787
@@ -192,7 +228,7 @@ Then open:
 http://127.0.0.1:8787
 ```
 
-The dashboard is designed for local use. It reads files such as `state/state.json`, `logs/runs.jsonl`, and `trades.jsonl` when present. Do not expose the dashboard publicly unless you understand your network, proxy, and authentication setup.
+The dashboard is designed for local use. It reads files such as `state/state.json`, `logs/runs.jsonl`, `logs/trades.jsonl`, `analysis/analytics_snapshots.jsonl`, and `analysis/order_reconciliation.json` when present. Do not expose the dashboard publicly unless you understand your network, proxy, and authentication setup.
 
 If your live bot state is in another folder, point the dashboard at it without moving secrets:
 
@@ -207,6 +243,16 @@ Replay recent scanner output against later public candles to sanity-check candid
 ```bash
 python candidate_forward_backtest.py --help
 ```
+
+### Order reconciliation
+
+After live trading, reconcile recent locally logged Coinbase orders against Coinbase historical order status:
+
+```bash
+python reconcile_orders.py --limit 10 --json
+```
+
+This writes `analysis/order_reconciliation.json` for the dashboard. It is intentionally manual/low-frequency to protect API limits.
 
 ### Live run
 
@@ -255,6 +301,7 @@ exit_monitor.py           Lightweight exit-only monitor
 trade_analytics_dashboard.py Local read-only performance dashboard
 candidate_forward_backtest.py Candidate follow-through analysis helper
 coinbase_client.py        Minimal Coinbase Advanced Trade helper
+reconcile_orders.py       Low-call historical order reconciliation helper
 DUAL_DIRECTION_SETUP.md    Notes on spot-safe dual-direction scoring
 scripts/*.sh              Portable shell wrappers for cron/systemd
 config.example.json       Safe default config template
