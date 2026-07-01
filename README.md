@@ -172,9 +172,9 @@ Keep `COINBASE_TRADING_ENABLED=0` until you intentionally enable live trading.
 4. Optional: add external provider keys.
 
 ```text
-HELIUS_API_KEY=your_helius_key_here
+HELIUS_API_KEY=<OPTIONAL_HELIUS_API_KEY>
 # or
-HELIUS_RPC_URL=optional_full_helius_rpc_url
+HELIUS_RPC_URL=<OPTIONAL_HELIUS_RPC_URL>
 ```
 
 ## Basic usage
@@ -277,6 +277,12 @@ python coinbase_spot_bot.py --config config.json --live
 ```
 
 ## Scheduling examples
+
+Before scheduling, create the local runtime folders. They are ignored by git so your state, logs, account-derived analytics, and reconciliation output do not get published accidentally.
+
+```bash
+mkdir -p state logs analysis
+```
 
 ### Linux/macOS cron
 

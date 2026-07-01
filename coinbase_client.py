@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Minimal Coinbase Advanced Trade REST client for Hermes/Umbrel.
+Minimal Coinbase Advanced Trade REST client for local/VPS deployments.
 
 Security defaults:
 - Reads credentials only from environment variables or a local .env file.
@@ -88,9 +88,9 @@ def build_jwt(method: str, path: str) -> str:
 
 def request(method: str, path: str, body: dict | None = None) -> dict:
     method = method.upper()
-    token = build_jwt(method, path)
+    jwt_bearer = build_jwt(method, path)
     headers = {
-        "Authorization": f"Bearer {token}",
+        "Authorization": f"Bearer {jwt_bearer}",
         "Content-Type": "application/json",
     }
     resp = requests.request(method, BASE_URL + path, headers=headers, json=body, timeout=30)

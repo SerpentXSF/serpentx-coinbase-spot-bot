@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Coinbase Advanced Trade spot strategy bot for SerpentX/Hermes.
+"""Coinbase Advanced Trade spot strategy bot.
 
 Defaults are intentionally safe:
 - Loads credentials from .env in the project directory or environment.
@@ -233,11 +233,11 @@ def build_jwt(method: str, path: str) -> str:
 
 def private_request(method: str, path: str, body: dict[str, Any] | None = None, params: dict[str, Any] | None = None) -> dict[str, Any]:
     method = method.upper()
-    token = build_jwt(method, path)
+    jwt_bearer = build_jwt(method, path)
     r = requests.request(
         method,
         BASE_URL + path,
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        headers={"Authorization": f"Bearer {jwt_bearer}", "Content-Type": "application/json"},
         json=body,
         params=params,
         timeout=30,
@@ -494,7 +494,7 @@ def _score_text_items(items: list[str], positive_words: set[str], negative_words
 
 
 def _market_headers(provider: str = "generic") -> dict[str, str]:
-    headers = {"User-Agent": "SerpentXHermesBot/1.0"}
+    headers = {"User-Agent": "SerpentXCoinbaseSpotBot/1.0"}
     if provider.startswith("coingecko"):
         cg_key = os.getenv("COINGECKO_API_KEY") or os.getenv("COINGECKO_DEMO_API_KEY") or os.getenv("COINGECKO_PRO_API_KEY")
         if cg_key:
@@ -672,7 +672,7 @@ def fetch_news_context(cfg: dict[str, Any], product_id: str, cache: dict[str, An
     params = {"q": f"({query}) crypto cryptocurrency", "hl": "en-US", "gl": "US", "ceid": "US:en"}
     out = {"score": 0, "reasons": [], "risk_block": False, "provider": "google_news_rss", "items": []}
     try:
-        r = requests.get(url, params=params, timeout=20, headers={"User-Agent": "SerpentXHermesBot/1.0"})
+        r = requests.get(url, params=params, timeout=20, headers={"User-Agent": "SerpentXCoinbaseSpotBot/1.0"})
         r.raise_for_status()
         titles = re.findall(r"<title><!\[CDATA\[(.*?)\]\]></title>|<title>(.*?)</title>", r.text, flags=re.S)
         parsed = []
@@ -717,7 +717,7 @@ def social_context(cfg: dict[str, Any], product_id: str, cache: dict[str, Any]) 
         q = " OR ".join(t for t in query_terms if t) or symbol
         url = f"https://www.reddit.com/r/{subreddits}/search.json"
         params = {"q": q, "restrict_sr": "on", "sort": "new", "t": "day", "limit": int(soc_cfg.get("reddit_limit", 8))}
-        r = requests.get(url, params=params, timeout=20, headers={"User-Agent": "SerpentXHermesBot/1.0"})
+        r = requests.get(url, params=params, timeout=20, headers={"User-Agent": "SerpentXCoinbaseSpotBot/1.0"})
         if r.status_code < 400:
             posts = r.json().get("data", {}).get("children", [])
             for post in posts:
