@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-ROOT = Path(os.getenv('COINBASE_BOT_ROOT', Path(__file__).resolve().parent)).resolve()
+ROOT = Path(os.getenv("COINBASE_BOT_ROOT", Path(__file__).resolve().parent)).resolve()
 sys.path.insert(0, str(ROOT))
 import coinbase_spot_bot as bot  # noqa: E402
 
@@ -30,6 +30,9 @@ TRADES = ROOT / 'trades.jsonl'
 ANALYSIS = ROOT / 'analysis' / 'usdc_pairs_latest.json'
 CACHE = ROOT / 'analysis' / 'order_cache.json'
 SNAPSHOTS = ROOT / 'analysis' / 'analytics_snapshots.jsonl'
+RUNS = ROOT / 'logs' / 'runs.jsonl'
+FORWARD_RETURNS = ROOT / 'analysis' / 'candidate_forward_returns.json'
+CRON_JOBS = Path(os.getenv("HERMES_CRON_JOBS", ROOT / "cron" / "jobs.json"))
 
 
 def utc_now() -> str:
@@ -71,6 +74,111 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
         except Exception:
             continue
     return rows
+
+
+def latest_jsonl(path: Path) -> dict[str, Any]:
+    rows = read_jsonl(path)
+    return rows[-1] if rows else {}
+
+
+def _context_score(ctx: dict[str, Any], name: str) -> int:
+    try:
+        return int(((ctx.get(name) or {}).get('score') or 0))
+    except Exception:
+        return 0
+
+
+def cron_health(jobs_path: Path = CRON_JOBS) -> dict[str, Any]:
+    data = load_json(jobs_path, {})
+    tracked = []
+    wanted = {
+        'coinbase_usdc_rotator.py',
+        'coinbase_exit_monitor.py',
+        'coinbase_dashboard_watchdog.py',
+        'coinbase_analytics_snapshot.py',
+        'coinbase_candidate_backtest.py',
+        'traderjoe_coinbase_recommendations.py',
+        'traderjoe_free_signal_collector.py',
+    }
+    for job in data.get('jobs') or []:
+        script = job.get('script') or ''
+        name = job.get('name') or ''
+        if script not in wanted and 'Coinbase' not in name and 'traderJoe' not in name:
+            continue
+        tracked.append({
+            'name': name,
+            'script': script,
+            'enabled': bool(job.get('enabled')),
+            'state': job.get('state') or '',
+            'schedule': job.get('schedule_display') or ((job.get('schedule') or {}).get('display')) or '',
+            'last_run_at': job.get('last_run_at'),
+            'next_run_at': job.get('next_run_at'),
+            'last_status': job.get('last_status') or '',
+            'last_error': job.get('last_error') or job.get('last_delivery_error'),
+        })
+    unhealthy = [j for j in tracked if not j['enabled'] or j['state'] not in {'scheduled', 'running'} or j['last_status'] not in {'', 'ok'}]
+    return {'status': 'attention' if unhealthy else 'ok', 'jobs': tracked, 'unhealthy_count': len(unhealthy)}
+
+
+def decision_snapshot(cfg: dict[str, Any], state: dict[str, Any], latest_run: dict[str, Any]) -> dict[str, Any]:
+    positions = bot.normalize_positions(state) if isinstance(state, dict) else []
+    env = latest_run.get('env_present') or bot.env_present()
+    balances = latest_run.get('balances') or {}
+    quote = fnum(balances.get('USDC'))
+    daily_used = int(fnum(latest_run.get('daily_trades_used')))
+    daily_max = int(fnum(cfg.get('daily_max_trades')))
+    max_positions = int(fnum(cfg.get('max_open_positions')))
+    blockers: list[str] = []
+    decision = str(latest_run.get('decision') or 'unknown')
+    if decision and decision not in {'STATUS_ONLY', 'PREVIEW_ONLY', 'ORDER_SENT'}:
+        blockers.append(decision.lower().replace('_', ' '))
+    if latest_run.get('cooldown_until'):
+        blockers.append('cooldown active')
+    if daily_max and daily_used >= daily_max:
+        blockers.append('daily trade limit reached')
+    if max_positions and len(positions) >= max_positions:
+        blockers.append('max open positions reached')
+    if quote and quote < fnum(cfg.get('min_quote_balance_to_trade')):
+        blockers.append('insufficient USDC')
+    top = latest_run.get('top') or {}
+    action = str(top.get('action') or '')
+    if action.startswith('BLOCKED'):
+        blockers.append(action.lower().replace('_', ' '))
+    for reason in top.get('reasons') or []:
+        text = str(reason)
+        low = text.lower()
+        if any(k in low for k in ['blocked', 'failed', 'limit', 'insufficient', 'overheated', 'fee guard']):
+            blockers.append(text)
+    blockers = list(dict.fromkeys(blockers))[:10]
+    return {
+        'latest_run_at': latest_run.get('ts'),
+        'decision': decision,
+        'top_product': top.get('product_id'),
+        'top_action': action,
+        'blockers': blockers,
+        'daily_trades_used': daily_used,
+        'daily_max_trades': daily_max,
+        'open_positions_count': len(positions),
+        'max_open_positions': max_positions,
+        'quote_balance_usdc': quote,
+        'live_gates': {
+            'active_trading': bool(cfg.get('active_trading')),
+            'coinbase_trading_env': bool(env.get('COINBASE_TRADING_ENABLED')),
+            'mode': latest_run.get('mode') or '',
+        },
+    }
+
+
+def forward_return_summary(path: Path = FORWARD_RETURNS) -> dict[str, Any]:
+    data = load_json(path, {})
+    rows = [r for r in (data.get('rows') or []) if isinstance(r.get('return_6h_pct'), (int, float))]
+    missed = sorted(rows, key=lambda r: fnum(r.get('return_6h_pct')), reverse=True)[:8]
+    return {
+        'generated_at': data.get('generated_at'),
+        'snapshots_analyzed': data.get('snapshots_analyzed'),
+        'top_by_6h': (data.get('by_product') or [])[:8],
+        'missed_candidates': missed,
+    }
 
 
 def order_id_from_log(row: dict[str, Any]) -> str | None:
@@ -124,6 +232,9 @@ def normalize_order(log_row: dict[str, Any], cached_detail: dict[str, Any] | Non
     else:
         net_cash = after or filled_value
 
+    oc = order.get('order_configuration') or {}
+    order_type = order.get('order_type') or log_row.get('order_type') or ('LIMIT' if 'limit_limit_gtc' in oc else ('MARKET' if 'market_market_ioc' in oc else ''))
+    post_only = bool(((oc.get('limit_limit_gtc') or {}).get('post_only')))
     return {
         'ts': log_row.get('ts') or order.get('created_time') or '',
         'order_id': order_id,
@@ -137,6 +248,10 @@ def normalize_order(log_row: dict[str, Any], cached_detail: dict[str, Any] | Non
         'net_cash': net_cash,
         'status': order.get('status') or '',
         'source': log_row.get('source') or '',
+        'order_type': order_type,
+        'time_in_force': order.get('time_in_force') or '',
+        'post_only': post_only,
+        'number_of_fills': fnum(order.get('number_of_fills')),
         'detail_error': (cached_detail or {}).get('error'),
     }
 
@@ -153,18 +268,26 @@ def pair_round_trips(orders: list[dict[str, Any]]) -> tuple[list[dict[str, Any]]
             # If no size available, treat one whole logged order as unit size.
             size = 1.0
         if o['side'] == 'BUY':
-            queues[product].append({**o, 'remaining_size': size, 'remaining_cost': fnum(o['net_cash'])})
+            queues[product].append({**o, 'remaining_size': size, 'remaining_cost': fnum(o['net_cash']), 'remaining_fees': fnum(o.get('fees'))})
             continue
         remaining = size
         proceeds_total = fnum(o['net_cash'])
         proceeds_per_unit = proceeds_total / size if size > 0 else 0.0
+        sell_fee_per_unit = fnum(o.get('fees')) / size if size > 0 else 0.0
         while remaining > 1e-12 and queues[product]:
             buy = queues[product][0]
-            qty = min(remaining, fnum(buy['remaining_size']))
-            buy_unit_cost = fnum(buy['remaining_cost']) / fnum(buy['remaining_size']) if fnum(buy['remaining_size']) > 0 else 0.0
+            buy_remaining_size = fnum(buy['remaining_size'])
+            qty = min(remaining, buy_remaining_size)
+            buy_unit_cost = fnum(buy['remaining_cost']) / buy_remaining_size if buy_remaining_size > 0 else 0.0
+            buy_fee = fnum(buy.get('remaining_fees')) * (qty / buy_remaining_size) if buy_remaining_size > 0 else 0.0
             cost = qty * buy_unit_cost
             proceeds = qty * proceeds_per_unit
             pnl = proceeds - cost
+            fees = buy_fee + (qty * sell_fee_per_unit)
+            entry_px = fnum(buy.get('avg_price'))
+            exit_px = fnum(o.get('avg_price'))
+            gross_move_pct = ((exit_px - entry_px) / entry_px) if entry_px > 0 and exit_px > 0 else 0.0
+            fee_roundtrip_pct = (fees / cost) if cost > 0 else 0.0
             closed.append({
                 'product_id': product,
                 'entry_ts': buy.get('ts'),
@@ -177,10 +300,20 @@ def pair_round_trips(orders: list[dict[str, Any]]) -> tuple[list[dict[str, Any]]
                 'proceeds': proceeds,
                 'pnl': pnl,
                 'pnl_pct': (pnl / cost) if cost > 0 else 0.0,
-                'fees': fnum(buy.get('fees')) * (qty / size if size > 0 else 1.0) + fnum(o.get('fees')) * (qty / size if size > 0 else 1.0),
+                'gross_move_pct': gross_move_pct,
+                'roundtrip_fee_pct': fee_roundtrip_pct,
+                'realized_roundtrip_cost_pct': fee_roundtrip_pct,
+                'fees': fees,
+                'entry_order_type': buy.get('order_type') or '',
+                'exit_order_type': o.get('order_type') or '',
+                'entry_post_only': bool(buy.get('post_only')),
+                'exit_post_only': bool(o.get('post_only')),
+                'entry_fills': fnum(buy.get('number_of_fills')),
+                'exit_fills': fnum(o.get('number_of_fills')),
             })
             buy['remaining_size'] = fnum(buy['remaining_size']) - qty
             buy['remaining_cost'] = fnum(buy['remaining_cost']) - cost
+            buy['remaining_fees'] = max(0.0, fnum(buy.get('remaining_fees')) - buy_fee)
             remaining -= qty
             if fnum(buy['remaining_size']) <= 1e-12:
                 queues[product].popleft()
@@ -228,6 +361,15 @@ def top_next_assets(cfg: dict[str, Any], limit: int = 5) -> list[dict[str, Any]]
         else:
             cooldown = False
         score = int(r.get('score') or r.get('long_score') or 0)
+        context = r.get('context') or {}
+        context_breakdown = {
+            'news': _context_score(context, 'news'),
+            'market': _context_score(context, 'market'),
+            'social': _context_score(context, 'social'),
+            'whale': _context_score(context, 'whale'),
+        }
+        context_score = int(fnum(r.get('context_score'), sum(context_breakdown.values())))
+        final_score = int(fnum(r.get('final_score'), score + context_score))
         change = fnum(r.get('change_24h'))
         blocked = bool(r.get('trading_disabled') or r.get('limit_only') or r.get('cancel_only') or r.get('is_disabled'))
         reasons = list(r.get('reasons') or [])
@@ -241,6 +383,11 @@ def top_next_assets(cfg: dict[str, Any], limit: int = 5) -> list[dict[str, Any]]
         out.append({
             'product_id': product,
             'score': score,
+            'technical_score': score,
+            'context_score': context_score,
+            'final_score': final_score,
+            'context_breakdown': context_breakdown,
+            'risk_block': bool(context.get('risk_block') or r.get('risk_block')),
             'action': r.get('action'),
             'price': fnum(r.get('price')),
             'change_24h': change,
@@ -254,7 +401,7 @@ def top_next_assets(cfg: dict[str, Any], limit: int = 5) -> list[dict[str, Any]]
             'blocked': blocked,
             'cooldown': cooldown,
         })
-    out.sort(key=lambda x: (not x['blocked'], not x['cooldown'], x['score'], x['change_24h'], x['quote_volume_24h_usdc']), reverse=True)
+    out.sort(key=lambda x: (not x['blocked'], not x['cooldown'], x['final_score'], x['score'], x['change_24h'], x['quote_volume_24h_usdc']), reverse=True)
     return out[:limit]
 
 
@@ -288,6 +435,7 @@ def build_summary(refresh_orders: bool = True) -> dict[str, Any]:
             rec['losses'] += 1
     assets = sorted(by_asset.values(), key=lambda x: x['pnl'])
     state = load_json(STATE, {})
+    latest_run = latest_jsonl(RUNS)
     open_positions = enrich_open_positions(state, cfg)
     equity_curve = []
     running = 0.0
@@ -307,6 +455,24 @@ def build_summary(refresh_orders: bool = True) -> dict[str, Any]:
     expectancy = (total_pnl / len(closed)) if closed else 0.0
     total_fees = sum(fnum(o.get('fees')) for o in order_rows)
     fee_drag_pct = (total_fees / total_cost) if total_cost > 0 else 0.0
+    limit_roundtrips = [t for t in closed if str(t.get('entry_order_type')).upper() == 'LIMIT' or str(t.get('exit_order_type')).upper() == 'LIMIT' or t.get('entry_post_only') or t.get('exit_post_only')]
+    recent_limit_roundtrips = limit_roundtrips[-20:]
+    fee_verify_cfg = cfg.get('maker_fee_verification') or {}
+    min_verify = int(fee_verify_cfg.get('min_roundtrips_before_trusting_geometry', 5)) if isinstance(fee_verify_cfg, dict) else 5
+    target_fee = fnum(fee_verify_cfg.get('target_roundtrip_cost_pct')) if isinstance(fee_verify_cfg, dict) else 0.01
+    warn_fee = fnum(fee_verify_cfg.get('warning_roundtrip_cost_pct')) if isinstance(fee_verify_cfg, dict) else 0.014
+    avg_limit_cost = (sum(fnum(t.get('realized_roundtrip_cost_pct')) for t in recent_limit_roundtrips) / len(recent_limit_roundtrips)) if recent_limit_roundtrips else 0.0
+    maker_fee_verification = {
+        'enabled': bool(fee_verify_cfg.get('enabled')) if isinstance(fee_verify_cfg, dict) else False,
+        'target_roundtrip_cost_pct': target_fee,
+        'warning_roundtrip_cost_pct': warn_fee,
+        'min_roundtrips_before_trusting_geometry': min_verify,
+        'limit_roundtrips': len(limit_roundtrips),
+        'recent_limit_roundtrips': len(recent_limit_roundtrips),
+        'avg_recent_roundtrip_cost_pct': avg_limit_cost,
+        'trusted_geometry': bool(len(limit_roundtrips) >= min_verify and avg_limit_cost > 0 and avg_limit_cost <= warn_fee),
+        'status': 'insufficient_limit_roundtrips' if len(limit_roundtrips) < min_verify else ('within_fee_assumption' if avg_limit_cost <= warn_fee else 'fee_too_high_for_geometry'),
+    }
 
     # Provider/API presence only; never values.
     env = bot.env_present()
@@ -317,9 +483,15 @@ def build_summary(refresh_orders: bool = True) -> dict[str, Any]:
             'take_profit_pct': fnum(cfg.get('take_profit_pct')),
             'stop_loss_pct': fnum(cfg.get('stop_loss_pct')),
             'soft_invalidation_pct': fnum(cfg.get('soft_invalidation_pct')),
+            'soft_invalidation_mode': (cfg.get('soft_invalidation') or {}).get('mode') if isinstance(cfg.get('soft_invalidation'), dict) else '',
+            'soft_invalidation_hard_cap_pct': fnum((cfg.get('soft_invalidation') or {}).get('hard_cap_pct')) if isinstance(cfg.get('soft_invalidation'), dict) else fnum(cfg.get('soft_invalidation_pct')),
             'trailing_stop_enabled': bool(cfg.get('trailing_stop_enabled')),
+            'breakeven_lock_enabled': bool(cfg.get('breakeven_lock_enabled')),
+            'breakeven_activation_pct': fnum(cfg.get('breakeven_activation_pct')),
+            'breakeven_lock_pct': fnum(cfg.get('breakeven_lock_pct')),
             'trailing_activation_pct': fnum(cfg.get('trailing_activation_pct')),
             'trailing_drawdown_pct': fnum(cfg.get('trailing_drawdown_pct')),
+            'estimated_roundtrip_fee_pct': fnum((cfg.get('fee_tracking') or {}).get('estimated_roundtrip_fee_pct')) if isinstance(cfg.get('fee_tracking'), dict) else 0.0,
         },
         'api_presence': env,
         'realized_pnl': total_pnl,
@@ -338,12 +510,17 @@ def build_summary(refresh_orders: bool = True) -> dict[str, Any]:
         'avg_loss': avg_loss,
         'expectancy_per_trade': expectancy,
         'fee_drag_pct': fee_drag_pct,
+        'maker_fee_verification': maker_fee_verification,
+        'recent_limit_roundtrips': recent_limit_roundtrips,
         'best_asset': max(assets, key=lambda x: x['pnl']) if assets else None,
         'worst_asset': min(assets, key=lambda x: x['pnl']) if assets else None,
         'asset_stats': sorted(assets, key=lambda x: x['pnl'], reverse=True),
         'open_positions': open_positions,
         'open_lots_from_orders': open_lots,
         'top_next_assets': top_next_assets(cfg, 5),
+        'decision_snapshot': decision_snapshot(cfg, state, latest_run),
+        'cron_health': cron_health(),
+        'forward_returns': forward_return_summary(),
         'closed_round_trips': closed[-50:],
         'equity_curve': equity_curve,
         'daily_pnl': daily_pnl,
@@ -379,9 +556,13 @@ HTML = r'''<!doctype html>
  <div class="card span4"><h3>Risk Settings</h3><div id="risk" class="riskgrid">—</div></div>
  <div class="card span6"><h3>Daily P/L — Last 14 Trading Days</h3><svg id="daily" class="miniSvg" viewBox="0 0 700 210" preserveAspectRatio="none"></svg></div>
  <div class="card span6"><h3>Asset P/L Leaderboard</h3><div id="assetBars">—</div></div>
- <div class="card span12"><h3>Top 5 Next Possible Trade Assets</h3><div id="candidateCards" class="candidateGrid"></div><div class="tablewrap desktopOnly"><table><thead><tr><th>Asset</th><th>Score</th><th>Price</th><th>24h</th><th>RSI</th><th>RSI Div</th><th>Vol</th><th>Status</th><th>Reasons</th></tr></thead><tbody id="top5"></tbody></table></div><div class="note">Candidates from latest scan/context filters — not guaranteed profitable trades and not live order instructions.</div></div>
+ <div class="card span12"><h3>Top 5 Next Possible Trade Assets</h3><div id="candidateCards" class="candidateGrid"></div><div class="tablewrap desktopOnly"><table><thead><tr><th>Asset</th><th>Score</th><th>Context</th><th>Price</th><th>24h</th><th>RSI</th><th>RSI Div</th><th>Vol</th><th>Status</th><th>Reasons</th></tr></thead><tbody id="top5"></tbody></table></div><div class="note">Candidates from latest scan/context filters — not guaranteed profitable trades and not live order instructions.</div></div>
  <div class="card span6"><h3>Open Positions</h3><div id="openpos">—</div></div>
  <div class="card span6"><h3>Recent Closed Round Trips</h3><div class="tablewrap"><table><thead><tr><th>Exit</th><th>Asset</th><th>P/L</th><th>%</th><th>Reason</th></tr></thead><tbody id="recent"></tbody></table></div></div>
+ <div class="card span6"><h3>Bot Health / Cron</h3><div id="bothealth">—</div></div>
+ <div class="card span6"><h3>Why No Trade?</h3><div id="decisionbox">—</div></div>
+ <div class="card span6"><h3>Maker Fee Verification</h3><div id="feeverify" class="riskgrid">—</div></div>
+ <div class="card span6"><h3>Missed Opportunity / Forward Returns</h3><div id="forwardreturns">—</div></div>
 </section></div><script>
 const fmt=(n,d=2)=>Number(n||0).toLocaleString(undefined,{maximumFractionDigits:d,minimumFractionDigits:d});
 const pct=n=>fmt((n||0)*100,1)+'%'; const cls=n=>(n||0)>=0?'green':'red';
@@ -396,12 +577,21 @@ function drawDonut(s){const wins=s.wins||0,losses=s.losses||0,total=Math.max(1,w
 function assetBox(a){if(!a)return '—'; return `<div class="val ${cls(a.pnl)}">${money(a.pnl)}</div><div><b>${a.product_id}</b></div><div class="small">${a.trades} trades · ${a.wins}W/${a.losses}L · fees $${fmt(a.fees)}</div>`}
 function assetBars(rows){const top=(rows||[]).slice(0,8);if(!top.length)return '—';const max=Math.max(...top.map(a=>Math.abs(a.pnl)),1);return top.map(a=>`<div class="barrow"><b>${a.product_id}</b><div class="bar ${a.pnl<0?'neg':''}"><span style="width:${Math.max(3,Math.abs(a.pnl)/max*100)}%"></span></div><span class="${cls(a.pnl)}">${money(a.pnl)}</span></div>`).join('')}
 function riskHtml(r){return `<div class="riskitem"><div class="label">Take Profit</div><b>${pct(r.take_profit_pct)}</b></div><div class="riskitem"><div class="label">Stop Loss</div><b>${pct(r.stop_loss_pct)}</b></div><div class="riskitem"><div class="label">Soft Invalid</div><b>${pct(r.soft_invalidation_pct)}</b></div><div class="riskitem"><div class="label">Trailing</div><b>${r.trailing_stop_enabled?'On':'Off'}</b><div class="small">after ${pct(r.trailing_activation_pct)} / drawdown ${pct(r.trailing_drawdown_pct)}</div></div>`}
-function candidateCard(a){const div=a.rsi_divergence_label&&a.rsi_divergence_label!=='None'?a.rsi_divergence_label:'No divergence';const divCls=a.rsi_divergence_signal==='bullish'?'green':(a.rsi_divergence_signal==='bearish'?'red':'small');return `<div class="candidate"><b>${a.product_id}</b><div class="small">Score ${a.score} · RSI ${fmt(a.rsi,1)}</div><div class="${cls(a.change_24h)}">24h ${fmt(a.change_24h,1)}%</div><div class="${divCls}">${div}</div><div class="pill ${a.blocked||a.cooldown?'blocked':'ok'}">${a.blocked?'blocked':a.cooldown?'cooldown':'candidate'}</div></div>`}
+function healthHtml(h){const jobs=(h.jobs||[]).slice(0,7);return `<div class="pill ${h.status==='ok'?'ok':'blocked'}">${h.status||'unknown'}</div><div class="small">${h.unhealthy_count||0} job(s) need attention</div>`+jobs.map(j=>`<div class="riskitem"><b>${j.name||j.script}</b><div class="small">${j.last_status||'n/a'} · last ${(j.last_run_at||'').slice(5,16).replace('T',' ')} · next ${(j.next_run_at||'').slice(5,16).replace('T',' ')}</div></div>`).join('')}
+function decisionHtml(d){const gates=d.live_gates||{};const blockers=d.blockers||[];return `<div class="riskgrid"><div class="riskitem"><div class="label">Decision</div><b>${d.decision||'unknown'}</b><div class="small">${d.top_product||''} ${d.top_action||''}</div></div><div class="riskitem"><div class="label">USDC</div><b>$${fmt(d.quote_balance_usdc)}</b><div class="small">daily ${d.daily_trades_used||0}/${d.daily_max_trades||0} · positions ${d.open_positions_count||0}/${d.max_open_positions||0}</div></div><div class="riskitem"><div class="label">Live Gates</div><b>${gates.active_trading&&gates.coinbase_trading_env?'Ready':'Check'}</b><div class="small">active ${gates.active_trading?'✓':'—'} · env ${gates.coinbase_trading_env?'✓':'—'} · ${gates.mode||''}</div></div></div><div class="note">${blockers.length?blockers.map(b=>'• '+b).join('<br>'):'No current blocker found in latest run log.'}</div>`}
+function feeVerifyHtml(f){return `<div class="riskitem"><div class="label">Status</div><b>${f.status||'n/a'}</b><div class="small">trusted: ${f.trusted_geometry?'yes':'no'}</div></div><div class="riskitem"><div class="label">Limit Round Trips</div><b>${f.limit_roundtrips||0}</b><div class="small">need ${f.min_roundtrips_before_trusting_geometry||0}</div></div><div class="riskitem"><div class="label">Avg Recent Cost</div><b>${pct(f.avg_recent_roundtrip_cost_pct||0)}</b><div class="small">warn above ${pct(f.warning_roundtrip_cost_pct||0)}</div></div>`}
+function forwardHtml(fr){const missed=(fr.missed_candidates||[]).slice(0,5);const top=(fr.top_by_6h||[]).slice(0,3);return `<div class="small">Updated ${fr.generated_at||'n/a'}</div>`+missed.map(r=>`<div class="barrow"><b>${r.product_id}</b><div class="bar ${r.return_6h_pct<0?'neg':''}"><span style="width:${Math.min(100,Math.max(3,Math.abs(r.return_6h_pct||0)*4))}%"></span></div><span class="${cls(r.return_6h_pct)}">${fmt(r.return_6h_pct,1)}% 6h</span></div>`).join('')+(top.length?`<div class="note">Best recurring: ${top.map(x=>`${x.product_id} ${fmt(x.avg_6h_pct,1)}%`).join(' · ')}</div>`:'')}
+function ctxText(a){const c=a.context_breakdown||{};return `N ${c.news||0} / M ${c.market||0} / S ${c.social||0} / W ${c.whale||0}`}
+function candidateCard(a){const div=a.rsi_divergence_label&&a.rsi_divergence_label!=='None'?a.rsi_divergence_label:'No divergence';const divCls=a.rsi_divergence_signal==='bullish'?'green':(a.rsi_divergence_signal==='bearish'?'red':'small');return `<div class="candidate"><b>${a.product_id}</b><div class="small">Final ${a.final_score??a.score} · tech ${a.technical_score??a.score} · ctx ${a.context_score||0}</div><div class="${cls(a.change_24h)}">24h ${fmt(a.change_24h,1)}%</div><div class="small">${ctxText(a)}</div><div class="${divCls}">${div}</div><div class="pill ${a.blocked||a.cooldown||a.risk_block?'blocked':'ok'}">${a.blocked?'blocked':a.cooldown?'cooldown':a.risk_block?'risk block':'candidate'}</div></div>`}
 async function load(){const r=await fetch('/api/summary');const s=await r.json();document.getElementById('sub').textContent=`Updated ${s.generated_at} · latest scan ${s.latest_analysis_at||'n/a'} · APIs: CG ${s.api_presence.COINGECKO_API_KEY?'✓':'—'} / CMC ${s.api_presence.COINMARKETCAP_API_KEY?'✓':'—'} / Birdeye ${s.api_presence.BIRDEYE_API_KEY?'✓':'—'}`;document.getElementById('pnl').className='val '+cls(s.realized_pnl);document.getElementById('pnl').textContent=money(s.realized_pnl);document.getElementById('roi').textContent='Return on deployed: '+pct(s.return_on_deployed);document.getElementById('pf').textContent=fmt(s.profit_factor,2);document.getElementById('expectancy').textContent='Expectancy/trade: '+money(s.expectancy_per_trade);document.getElementById('feesBig').textContent='$'+fmt(s.total_fees);document.getElementById('feeDrag').textContent='Fee drag: '+pct(s.fee_drag_pct);document.getElementById('winrate').textContent=pct(s.win_rate);document.getElementById('wins').textContent=`${s.wins} wins · ${s.losses} losses · ${s.closed_trades} closed`;document.getElementById('avgwin').textContent=money(s.avg_win);document.getElementById('avgloss').textContent='-'+money(s.avg_loss).replace('+','');document.getElementById('best').innerHTML=assetBox(s.best_asset);document.getElementById('worst').innerHTML=assetBox(s.worst_asset);drawCurve(s.equity_curve||[]);drawDaily(s.daily_pnl||[]);drawDonut(s);document.getElementById('assetBars').innerHTML=assetBars(s.asset_stats||[]);
  const rsk=s.risk;document.getElementById('risk').innerHTML=riskHtml(rsk);
+ document.getElementById('bothealth').innerHTML=healthHtml(s.cron_health||{});
+ document.getElementById('decisionbox').innerHTML=decisionHtml(s.decision_snapshot||{});
+ document.getElementById('feeverify').innerHTML=feeVerifyHtml(s.maker_fee_verification||{});
+ document.getElementById('forwardreturns').innerHTML=forwardHtml(s.forward_returns||{});
  document.getElementById('openpos').innerHTML=(s.open_positions||[]).length?(s.open_positions||[]).map(p=>`<div class="riskitem"><b>${p.product_id}</b><div class="small">entry ${fmt(p.entry_price,6)} · current ${fmt(p.current_price,6)}</div><span class="${cls(p.unrealized_pnl_pct)}">${pct(p.unrealized_pnl_pct)}</span></div>`).join(''):'<div class="note">No bot-managed open positions</div>';
  document.getElementById('candidateCards').innerHTML=(s.top_next_assets||[]).map(candidateCard).join('');
- document.getElementById('top5').innerHTML=(s.top_next_assets||[]).map(a=>{const div=a.rsi_divergence_label&&a.rsi_divergence_label!=='None'?a.rsi_divergence_label:'—';const divCls=a.rsi_divergence_signal==='bullish'?'green':(a.rsi_divergence_signal==='bearish'?'red':'');return `<tr><td><b>${a.product_id}</b></td><td>${a.score}</td><td>${fmt(a.price,6)}</td><td class="${cls(a.change_24h)}">${fmt(a.change_24h,1)}%</td><td>${fmt(a.rsi,1)}</td><td class="${divCls}">${div}</td><td>$${fmt(a.quote_volume_24h_usdc,0)}</td><td><span class="pill ${a.blocked||a.cooldown?'blocked':'ok'}">${a.blocked?'blocked':a.cooldown?'cooldown':'candidate'}</span></td><td>${(a.reasons||[]).slice(0,2).join('; ')} ${(a.cautions||[]).length?'<span class="yellow">⚠ '+a.cautions[0]+'</span>':''}</td></tr>`}).join('');
+ document.getElementById('top5').innerHTML=(s.top_next_assets||[]).map(a=>{const div=a.rsi_divergence_label&&a.rsi_divergence_label!=='None'?a.rsi_divergence_label:'—';const divCls=a.rsi_divergence_signal==='bullish'?'green':(a.rsi_divergence_signal==='bearish'?'red':'');return `<tr><td><b>${a.product_id}</b></td><td>${a.final_score??a.score}<div class="small">tech ${a.technical_score??a.score}</div></td><td>${ctxText(a)}</td><td>${fmt(a.price,6)}</td><td class="${cls(a.change_24h)}">${fmt(a.change_24h,1)}%</td><td>${fmt(a.rsi,1)}</td><td class="${divCls}">${div}</td><td>$${fmt(a.quote_volume_24h_usdc,0)}</td><td><span class="pill ${a.blocked||a.cooldown||a.risk_block?'blocked':'ok'}">${a.blocked?'blocked':a.cooldown?'cooldown':a.risk_block?'risk block':'candidate'}</span></td><td>${(a.reasons||[]).slice(0,2).join('; ')} ${(a.cautions||[]).length?'<span class="yellow">⚠ '+a.cautions[0]+'</span>':''}</td></tr>`}).join('');
  document.getElementById('recent').innerHTML=(s.closed_round_trips||[]).slice(-10).reverse().map(t=>`<tr><td>${(t.exit_ts||'').slice(5,16).replace('T',' ')}</td><td>${t.product_id}</td><td class="${cls(t.pnl)}">${money(t.pnl)}</td><td class="${cls(t.pnl_pct)}">${pct(t.pnl_pct)}</td><td>${t.reason||''}</td></tr>`).join('');}
 load(); setInterval(load,60000);
 </script></body></html>'''
@@ -442,7 +632,7 @@ def write_snapshot() -> dict[str, Any]:
     data = build_summary(refresh_orders=True)
     SNAPSHOTS.parent.mkdir(parents=True, exist_ok=True)
     with SNAPSHOTS.open('a') as f:
-        f.write(json.dumps({k: data[k] for k in ['generated_at','realized_pnl','closed_trades','wins','losses','win_rate','loss_rate','best_asset','worst_asset','top_next_assets']}, default=str) + '\n')
+        f.write(json.dumps({k: data[k] for k in ['generated_at','realized_pnl','closed_trades','wins','losses','win_rate','loss_rate','total_fees','fee_drag_pct','maker_fee_verification','best_asset','worst_asset','top_next_assets']}, default=str) + '\n')
     return data
 
 

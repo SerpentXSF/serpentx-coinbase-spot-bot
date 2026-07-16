@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import json, math, os, time
+import json, time, math
 from datetime import datetime, timezone
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import requests
+import coinbase_spot_bot as bot
 
 BASE='https://api.coinbase.com'
-ROOT=Path(os.getenv('COINBASE_BOT_ROOT', Path(__file__).resolve().parent)).resolve()
-OUTDIR=ROOT / 'analysis'
+OUTDIR=(Path(os.getenv("COINBASE_BOT_ROOT", Path(__file__).resolve().parent)).resolve() / "analysis")
 OUTDIR.mkdir(parents=True, exist_ok=True)
 
 GRAN = {'FIFTEEN_MINUTE': 900, 'ONE_HOUR': 3600}
@@ -96,9 +96,9 @@ def score_product(p):
     elif e9>e21:
         score+=1; reasons.append('15m short-term EMA bullish')
     if px>t50:
-        score+=1; reasons.append('price above 1H EMA50')
+        score+=1; reasons.append('price above 30m EMA50')
     if t20>t50:
-        score+=1; reasons.append('1H trend EMA20 > EMA50')
+        score+=1; reasons.append('30m trend EMA20 > EMA50')
     if 42<=rrsi<=68:
         score+=1; reasons.append(f'RSI supportive {rrsi:.1f}')
     elif rrsi>72:
@@ -134,9 +134,9 @@ def score_product(p):
     elif e9 < e21:
         short_score += 1; short_reasons.append('15m short-term EMA bearish')
     if px < t50:
-        short_score += 1; short_reasons.append('price below 1H EMA50')
+        short_score += 1; short_reasons.append('price below 30m EMA50')
     if t20 < t50:
-        short_score += 1; short_reasons.append('1H trend EMA20 < EMA50')
+        short_score += 1; short_reasons.append('30m trend EMA20 < EMA50')
     if 32 <= rrsi <= 58:
         short_score += 1; short_reasons.append(f'RSI downside/supportive {rrsi:.1f}')
     elif rrsi < 25:

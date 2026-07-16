@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""Coinbase Advanced Trade spot strategy bot.
+"""Coinbase Advanced Trade spot strategy bot for SerpentX/Hermes.
 
 Defaults are intentionally safe:
-- Loads credentials from .env in the project directory or environment.
+- Loads credentials from .env or environment.
 - Public market analysis works without credentials.
 - Private account verification requires COINBASE_API_KEY_NAME and COINBASE_API_PRIVATE_KEY.
 - Live orders require all three gates: config active_trading=true, COINBASE_TRADING_ENABLED=1, and --live.
@@ -71,7 +71,7 @@ def save_json(path: Path, data: dict[str, Any]) -> None:
 
 def _provider_budget_path(cfg: dict[str, Any] | None = None) -> Path:
     cfg = cfg or {}
-    return Path(cfg.get("provider_budget_path") or (ROOT / "state" / "provider_budget.json"))
+    return Path(cfg.get("provider_budget_path") or str(ROOT / "state" / "provider_budget.json"))
 
 
 def _provider_state(cfg: dict[str, Any], provider: str) -> tuple[dict[str, Any], Path, dict[str, Any]]:
@@ -154,6 +154,10 @@ def load_dotenv(path: str | Path) -> None:
         if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
             value = value[1:-1]
         value = value.replace("\\n", "\n")
+        # Shared provider templates intentionally contain blank placeholders.
+        # Do not let an empty centralized value mask a project-local fallback.
+        if value == "":
+            continue
         os.environ.setdefault(key, value)
 
 
@@ -164,6 +168,8 @@ def env_present() -> dict[str, bool]:
         "COINBASE_TRADING_ENABLED": os.getenv("COINBASE_TRADING_ENABLED") == "1",
         "HELIUS_API_KEY": bool(os.getenv("HELIUS_API_KEY")),
         "HELIUS_RPC_URL": bool(os.getenv("HELIUS_RPC_URL") or os.getenv("HELIUS_GATEKEEPER_RPC_URL")),
+        "ALCHEMY_SOLANA_RPC_URL": bool(os.getenv("ALCHEMY_SOLANA_RPC_URL")),
+        "ALCHEMY_SOLANA_WSS_URL": bool(os.getenv("ALCHEMY_SOLANA_WSS_URL")),
         "UNUSUAL_WHALES_API_KEY": bool(os.getenv("UNUSUAL_WHALES_API_KEY")),
         "COINGECKO_API_KEY": bool(os.getenv("COINGECKO_API_KEY") or os.getenv("COINGECKO_DEMO_API_KEY") or os.getenv("COINGECKO_PRO_API_KEY")),
         "COINMARKETCAP_API_KEY": bool(os.getenv("COINMARKETCAP_API_KEY")),
@@ -214,12 +220,40 @@ def algorithm_for(private_key) -> str:
     raise RuntimeError(f"Unsupported private key type: {type(private_key).__name__}")
 
 
+_COINBASE_TIME_OFFSET = {"value": 0.0, "checked_at": 0.0}
+
+
+def coinbase_epoch_now() -> int:
+    """Return Coinbase-aligned epoch seconds for JWT auth.
+
+    WSL clocks can drift a few minutes after host sleep/restart. Coinbase JWTs
+    only live for 120 seconds, so a local clock that is behind the API server
+    causes otherwise-valid credentials to return 401 Unauthorized. Cache the
+    public Coinbase Date-header offset briefly and use it for private JWTs.
+    """
+    now = time.time()
+    if now - float(_COINBASE_TIME_OFFSET.get("checked_at") or 0) < 300:
+        return int(now + float(_COINBASE_TIME_OFFSET.get("value") or 0))
+    try:
+        r = requests.get(BASE_URL + "/api/v3/brokerage/market/products/BTC-USDC", timeout=10)
+        server_date = r.headers.get("Date")
+        if server_date:
+            server_dt = parsedate_to_datetime(server_date)
+            offset = server_dt.timestamp() - now
+            # Ignore tiny skew but correct material drift that would expire JWTs.
+            _COINBASE_TIME_OFFSET["value"] = offset if abs(offset) > 30 else 0.0
+            _COINBASE_TIME_OFFSET["checked_at"] = now
+    except Exception:
+        _COINBASE_TIME_OFFSET["checked_at"] = now
+    return int(time.time() + float(_COINBASE_TIME_OFFSET.get("value") or 0))
+
+
 def build_jwt(method: str, path: str) -> str:
     if jwt is None:
         raise RuntimeError("Missing auth dependency: PyJWT")
     key_name = require_env("COINBASE_API_KEY_NAME")
     private_key = load_private_key(require_env("COINBASE_API_PRIVATE_KEY"))
-    now = int(time.time())
+    now = coinbase_epoch_now()
     payload = {
         "sub": key_name,
         "iss": "cdp",
@@ -233,11 +267,11 @@ def build_jwt(method: str, path: str) -> str:
 
 def private_request(method: str, path: str, body: dict[str, Any] | None = None, params: dict[str, Any] | None = None) -> dict[str, Any]:
     method = method.upper()
-    jwt_bearer = build_jwt(method, path)
+    token = build_jwt(method, path)
     r = requests.request(
         method,
         BASE_URL + path,
-        headers={"Authorization": f"Bearer {jwt_bearer}", "Content-Type": "application/json"},
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
         json=body,
         params=params,
         timeout=30,
@@ -433,8 +467,14 @@ NEGATIVE_CONTEXT_WORDS = {
 POSITIVE_CONTEXT_WORDS = {
     "upgrade", "partnership", "integrates", "integration", "launch", "mainnet", "listing",
     "listed", "etf", "approval", "adoption", "funding", "revenue", "record", "growth",
+    # Institutional/tokenization catalysts. These are bounded context boosts only;
+    # they cannot bypass technical, regime, fee, sizing, or risk gates.
+    "tokenization", "tokenized", "tokenize", "rwa", "real world asset", "real-world asset",
+    "dtcc", "dtc", "franklin", "franklin templeton", "benji", "mastercard",
+    "stablecoin", "stablecoins", "payments", "payfi", "institutional", "money market",
+    "treasury", "settlement", "public blockchain",
 }
-SOCIAL_POSITIVE_WORDS = {"bullish", "breakout", "accumulating", "accumulation", "strong", "support", "trend"}
+SOCIAL_POSITIVE_WORDS = {"bullish", "breakout", "accumulating", "accumulation", "strong", "support", "trend", "tokenization", "tokenized", "rwa", "payfi", "institutional"}
 SOCIAL_NEGATIVE_WORDS = {"bearish", "dump", "scam", "rug", "panic", "exploit", "hack", "selloff"}
 
 
@@ -478,8 +518,17 @@ def _token_meta(cfg: dict[str, Any], product_id: str) -> dict[str, Any]:
 
 def _score_text_items(items: list[str], positive_words: set[str], negative_words: set[str], *, strong_negative=-2, mild_negative=-1, mild_positive=1, strong_positive=2) -> tuple[int, list[str], list[str]]:
     joined = " ".join(items).lower()
-    pos_hits = sorted(w for w in positive_words if re.search(r"\b" + re.escape(w) + r"\b", joined))
-    neg_hits = sorted(w for w in negative_words if re.search(r"\b" + re.escape(w) + r"\b", joined))
+    def hits(words: set[str]) -> list[str]:
+        out = []
+        for raw in words:
+            w = str(raw or "").strip().lower()
+            if not w:
+                continue
+            if re.search(r"\b" + re.escape(w) + r"\b", joined):
+                out.append(w)
+        return sorted(set(out))
+    pos_hits = hits(positive_words)
+    neg_hits = hits(negative_words)
     score = 0
     if len(neg_hits) >= 2:
         score = strong_negative
@@ -494,7 +543,7 @@ def _score_text_items(items: list[str], positive_words: set[str], negative_words
 
 
 def _market_headers(provider: str = "generic") -> dict[str, str]:
-    headers = {"User-Agent": "SerpentXCoinbaseSpotBot/1.0"}
+    headers = {"User-Agent": "SerpentXHermesBot/1.0"}
     if provider.startswith("coingecko"):
         cg_key = os.getenv("COINGECKO_API_KEY") or os.getenv("COINGECKO_DEMO_API_KEY") or os.getenv("COINGECKO_PRO_API_KEY")
         if cg_key:
@@ -664,7 +713,9 @@ def fetch_news_context(cfg: dict[str, Any], product_id: str, cache: dict[str, An
         return {**cached, "cached": True}
     meta = _token_meta(cfg, product_id)
     symbol = _base_symbol(product_id)
-    terms = meta.get("news_terms") or [symbol, meta.get("name", "")]
+    base_terms = list(meta.get("news_terms") or [symbol, meta.get("name", "")])
+    narrative_terms = [str(t) for t in (meta.get("narrative_terms") or []) if str(t).strip()]
+    terms = base_terms + narrative_terms[:8]
     query = " OR ".join(t for t in terms if t)
     if not query:
         query = symbol
@@ -672,7 +723,7 @@ def fetch_news_context(cfg: dict[str, Any], product_id: str, cache: dict[str, An
     params = {"q": f"({query}) crypto cryptocurrency", "hl": "en-US", "gl": "US", "ceid": "US:en"}
     out = {"score": 0, "reasons": [], "risk_block": False, "provider": "google_news_rss", "items": []}
     try:
-        r = requests.get(url, params=params, timeout=20, headers={"User-Agent": "SerpentXCoinbaseSpotBot/1.0"})
+        r = requests.get(url, params=params, timeout=20, headers={"User-Agent": "SerpentXHermesBot/1.0"})
         r.raise_for_status()
         titles = re.findall(r"<title><!\[CDATA\[(.*?)\]\]></title>|<title>(.*?)</title>", r.text, flags=re.S)
         parsed = []
@@ -680,7 +731,9 @@ def fetch_news_context(cfg: dict[str, Any], product_id: str, cache: dict[str, An
             title = re.sub(r"\s+", " ", (a or b)).strip()
             if title:
                 parsed.append(title)
-        score, pos, neg = _score_text_items(parsed, POSITIVE_CONTEXT_WORDS, NEGATIVE_CONTEXT_WORDS)
+        product_positive_words = set(POSITIVE_CONTEXT_WORDS)
+        product_positive_words.update(str(t).lower() for t in (meta.get("narrative_terms") or []) if str(t).strip())
+        score, pos, neg = _score_text_items(parsed, product_positive_words, NEGATIVE_CONTEXT_WORDS)
         out.update({"score": max(-2, min(2, score)), "items": parsed[:5], "positive_hits": pos, "negative_hits": neg})
         if neg:
             out["reasons"].append("negative news keywords: " + ", ".join(neg[:5]))
@@ -717,7 +770,7 @@ def social_context(cfg: dict[str, Any], product_id: str, cache: dict[str, Any]) 
         q = " OR ".join(t for t in query_terms if t) or symbol
         url = f"https://www.reddit.com/r/{subreddits}/search.json"
         params = {"q": q, "restrict_sr": "on", "sort": "new", "t": "day", "limit": int(soc_cfg.get("reddit_limit", 8))}
-        r = requests.get(url, params=params, timeout=20, headers={"User-Agent": "SerpentXCoinbaseSpotBot/1.0"})
+        r = requests.get(url, params=params, timeout=20, headers={"User-Agent": "SerpentXHermesBot/1.0"})
         if r.status_code < 400:
             posts = r.json().get("data", {}).get("children", [])
             for post in posts:
@@ -762,12 +815,20 @@ def whale_context(cfg: dict[str, Any], product_id: str, cache: dict[str, Any]) -
         cache[key] = out
         return out
     endpoint = (
-        os.getenv("HELIUS_RPC_URL")
+        os.getenv("ALCHEMY_SOLANA_RPC_URL")
+        or os.getenv("SOLANA_RPC_URL")
+        or os.getenv("HELIUS_RPC_URL")
         or os.getenv("HELIUS_GATEKEEPER_RPC_URL")
         or os.getenv("QUICKNODE_SOLANA_RPC_URL")
-        or os.getenv("SOLANA_RPC_URL")
     )
-    provider = "helius_rpc" if (os.getenv("HELIUS_RPC_URL") or os.getenv("HELIUS_GATEKEEPER_RPC_URL")) else "quicknode_rpc"
+    if os.getenv("ALCHEMY_SOLANA_RPC_URL") or "alchemy" in str(os.getenv("SOLANA_RPC_URL") or "").lower():
+        provider = "alchemy_solana_rpc"
+    elif os.getenv("HELIUS_RPC_URL") or os.getenv("HELIUS_GATEKEEPER_RPC_URL"):
+        provider = "helius_rpc"
+    elif os.getenv("QUICKNODE_SOLANA_RPC_URL"):
+        provider = "quicknode_rpc"
+    else:
+        provider = "solana_rpc"
     api_key = os.getenv("HELIUS_API_KEY")
     if not endpoint and api_key:
         endpoint = f"https://mainnet.helius-rpc.com/?api-key={api_key}"
@@ -884,13 +945,15 @@ def _apply_five_minute_confirmation(cfg: dict[str, Any], sig: Signal) -> Signal:
     ema21_5m = ema(closes[-80:], 21)
     latest = closes[-1]
     prior = closes[-2] if len(closes) >= 2 else latest
-    if latest >= ema21_5m and ema9_5m >= ema21_5m and latest >= prior:
+    recent_pullback = min(closes[-6:]) <= ema9_5m if len(closes) >= 6 else prior <= ema9_5m
+    reclaim_ema9 = latest >= ema9_5m and prior <= latest
+    if latest >= ema21_5m and ema9_5m >= ema21_5m and reclaim_ema9 and (recent_pullback or not cfg.get("five_minute_reclaim_ema9_enabled", False)):
         sig.five_minute_confirmed = True
-        sig.five_minute_reason = "5m confirmation bullish/steady"
+        sig.five_minute_reason = "5m reclaimed EMA9 after pullback; bullish/steady"
         sig.reasons.append(sig.five_minute_reason)
     else:
         sig.five_minute_confirmed = False
-        sig.five_minute_reason = "5m confirmation failed; avoiding weak immediate entry"
+        sig.five_minute_reason = "5m EMA9 reclaim trigger failed; avoiding breakout-pop entry"
         sig.risk_block = True
         sig.action = "HOLD_USDC"
         sig.reasons.append(sig.five_minute_reason)
@@ -941,6 +1004,7 @@ def score_product(cfg: dict[str, Any], product_id: str) -> Signal:
     ema9 = ema(closes[-60:], 9)
     ema21 = ema(closes[-80:], 21)
     ema50 = ema(closes[-120:], 50)
+    trend20 = ema(trend_closes[-80:], 20)
     trend50 = ema(trend_closes[-120:], 50)
     cur_rsi = rsi(closes, 14)
     divergence = rsi_divergence(
@@ -957,8 +1021,13 @@ def score_product(cfg: dict[str, Any], product_id: str) -> Signal:
     # Spot-only: buy strength on trend alignment or controlled pullbacks; otherwise hold USDC.
     if ema9 > ema21 > ema50:
         score += 2; reasons.append("15m EMA stack bullish")
-    if price > trend50:
-        score += 1; reasons.append("above 1H EMA50")
+    if cfg.get("thirty_minute_regime_gate_enabled", cfg.get("one_hour_regime_gate_enabled", False)):
+        if price > trend50 and trend20 > trend50:
+            score += 1; reasons.append("30m regime bullish: price>EMA50 and EMA20>EMA50")
+        else:
+            reasons.append("30m regime gate failed")
+    elif price > trend50:
+        score += 1; reasons.append("above 30m EMA50")
     if 42 <= cur_rsi <= 68:
         score += 1; reasons.append(f"RSI supportive {cur_rsi:.1f}")
     elif cur_rsi < 35 and price > trend50:
@@ -977,8 +1046,32 @@ def score_product(cfg: dict[str, Any], product_id: str) -> Signal:
         score += 1; reasons.append("active volume")
     if avg_exec_range >= float(cfg.get("min_avg_exec_range_pct", 0.0)):
         reasons.append(f"avg exec range {avg_exec_range*100:.2f}%")
-    action = "BUY" if score >= int(cfg["score_threshold"]) else "HOLD_USDC"
+    htf = cfg.get("higher_timeframe_regime_gate", {})
+    if htf.get("enabled"):
+        try:
+            htf_c = fetch_candles(product_id, str(htf.get("granularity", "ONE_DAY")), int(htf.get("lookback_hours", 720)))
+            htf_closes = [fnum(c.get("close")) for c in htf_c if fnum(c.get("close")) > 0]
+            htf20 = ema(htf_closes[-80:], 20)
+            htf50 = ema(htf_closes[-120:], 50)
+            htf_price = htf_closes[-1] if htf_closes else price
+            htf_ok = len(htf_closes) >= 50
+            if htf.get("require_price_above_ema50", True):
+                htf_ok = htf_ok and htf_price > htf50
+            if htf.get("require_ema20_above_ema50", True):
+                htf_ok = htf_ok and htf20 > htf50
+            if htf_ok:
+                reasons.append(f"{htf.get('granularity', 'ONE_DAY')} regime bullish")
+            else:
+                reasons.append(f"{htf.get('granularity', 'ONE_DAY')} regime gate failed")
+                score -= 2
+        except Exception as exc:
+            reasons.append(f"higher timeframe gate unavailable: {str(exc)[:80]}")
+    regime_block = any("regime gate failed" in r for r in reasons)
+    action = "BUY" if score >= int(cfg["score_threshold"]) and not regime_block else "HOLD_USDC"
     sig = Signal(product_id, price, score, action, reasons, cur_rsi, chg, vol, avg_exec_range_pct=avg_exec_range)
+    if regime_block:
+        sig.risk_block = True
+        sig.reasons.append("regime gate blocked long entry")
     sig.rsi_divergence = divergence
     sig.rsi_divergence_label = div_label
     sig.rsi_divergence_signal = div_signal
@@ -1068,6 +1161,213 @@ def place_market(product_id: str, side: str, quote_size: float | None = None, ba
     oc = market_order_config(product_id, quote_size=quote_size, base_size=base_size)
     body = {"client_order_id": str(uuid.uuid4()), "product_id": product_id, "side": side.upper(), "order_configuration": oc}
     return private_request("POST", "/api/v3/brokerage/orders", body)
+
+
+def _quantize_price(product_id: str, price: float | str | Decimal) -> str:
+    info = product_metadata(product_id)
+    inc = _decimal_from(info.get("quote_increment") or "0.00000001")
+    raw = _decimal_from(price)
+    if raw <= 0:
+        return "0"
+    if inc <= 0:
+        return _format_decimal(raw)
+    return _format_decimal((raw / inc).to_integral_value(rounding=ROUND_DOWN) * inc)
+
+
+def maker_limit_price(cfg: dict[str, Any], product_id: str, side: str, reference_price: float | None = None) -> str:
+    """Return a conservative post-only limit price that should rest, not cross."""
+    ref = fnum(reference_price) or fnum(product_info(product_id).get("price"))
+    if ref <= 0:
+        raise RuntimeError(f"No reference price for maker limit {product_id}")
+    offset = float(cfg.get("maker_limit_price_offset_pct", 0.001))
+    if side.upper() == "BUY":
+        px = ref * (1 - offset)
+    else:
+        px = ref * (1 + offset)
+    q = _quantize_price(product_id, px)
+    if _decimal_from(q) <= 0:
+        raise RuntimeError(f"{product_id} limit price quantized to zero")
+    return q
+
+
+def limit_order_config(product_id: str, side: str, limit_price: float | str | Decimal, quote_size: float | None = None, base_size: float | None = None, post_only: bool = True) -> dict[str, Any]:
+    """Coinbase Advanced Trade limit GTC config.
+
+    Limit GTC requires base_size, so BUY quote_size is converted at limit_price
+    and floored to the product base increment. post_only=true avoids taker fills;
+    if Coinbase rejects a crossing order we treat it as no trade instead of
+    silently paying taker fees.
+    """
+    price_s = _quantize_price(product_id, limit_price)
+    price_d = _decimal_from(price_s)
+    if price_d <= 0:
+        raise RuntimeError(f"{product_id} invalid limit price {limit_price!r}")
+    if base_size is None:
+        if quote_size is None:
+            raise RuntimeError("quote_size or base_size required")
+        base_size = float(_decimal_from(str(quote_size)) / price_d)
+    b = quantize_order_size(product_id, "base_size", base_size)
+    if _decimal_from(b) <= 0:
+        raise RuntimeError(f"{product_id} base_size is below Coinbase minimum after quantization")
+    return {"limit_limit_gtc": {"base_size": b, "limit_price": price_s, "post_only": bool(post_only)}}
+
+
+def preview_limit(product_id: str, side: str, limit_price: float | str | Decimal, quote_size: float | None = None, base_size: float | None = None, post_only: bool = True) -> dict[str, Any]:
+    oc = limit_order_config(product_id, side, limit_price, quote_size=quote_size, base_size=base_size, post_only=post_only)
+    return private_request("POST", "/api/v3/brokerage/orders/preview", {"product_id": product_id, "side": side.upper(), "order_configuration": oc})
+
+
+def place_limit(product_id: str, side: str, limit_price: float | str | Decimal, quote_size: float | None = None, base_size: float | None = None, post_only: bool = True) -> dict[str, Any]:
+    oc = limit_order_config(product_id, side, limit_price, quote_size=quote_size, base_size=base_size, post_only=post_only)
+    body = {"client_order_id": str(uuid.uuid4()), "product_id": product_id, "side": side.upper(), "order_configuration": oc}
+    return private_request("POST", "/api/v3/brokerage/orders", body)
+
+
+def order_id_from_response(order: dict[str, Any]) -> str:
+    return str(((order.get("success_response") or {}).get("order_id") or order.get("order_id") or ""))
+
+
+def fetch_order_detail(order_id: str) -> dict[str, Any]:
+    detail = private_request("GET", f"/api/v3/brokerage/orders/historical/{order_id}")
+    return detail.get("order") or detail
+
+
+def cancel_order(order_id: str) -> dict[str, Any]:
+    return private_request("POST", "/api/v3/brokerage/orders/batch_cancel", {"order_ids": [order_id]})
+
+
+def normalize_pending_orders(state: dict[str, Any]) -> list[dict[str, Any]]:
+    rows = state.get("pending_orders")
+    if not isinstance(rows, list):
+        state["pending_orders"] = []
+        return []
+    clean = [r for r in rows if isinstance(r, dict) and r.get("order_id") and r.get("product_id")]
+    if clean != rows:
+        state["pending_orders"] = clean
+    return clean
+
+
+def pending_order_active(state: dict[str, Any], product_id: str | None = None, side: str | None = None) -> bool:
+    for row in normalize_pending_orders(state):
+        if product_id and row.get("product_id") != product_id:
+            continue
+        if side and str(row.get("side", "")).upper() != side.upper():
+            continue
+        return True
+    return False
+
+
+def _parse_iso(ts: str) -> datetime | None:
+    try:
+        if ts.endswith("Z"):
+            ts = ts[:-1] + "+00:00"
+        out = datetime.fromisoformat(ts)
+        return out if out.tzinfo else out.replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
+def reconcile_pending_orders(cfg: dict[str, Any], state: dict[str, Any], balances: dict[str, float] | None = None) -> list[dict[str, Any]]:
+    """Refresh pending limit orders and apply filled orders to local position state."""
+    pending = normalize_pending_orders(state)
+    if not pending:
+        return []
+    remaining: list[dict[str, Any]] = []
+    events: list[dict[str, Any]] = []
+    positions = normalize_positions(state)
+    timeout_min = float(cfg.get("maker_limit_pending_timeout_minutes", 90))
+    for row in pending:
+        event = {"pending_order": row, "ts": utcnow().isoformat()}
+        try:
+            detail = fetch_order_detail(str(row["order_id"]))
+            event["order_detail"] = detail
+        except Exception as exc:
+            row["last_reconcile_error"] = str(exc)[:240]
+            remaining.append(row)
+            events.append({**event, "decision": "PENDING_RECONCILE_ERROR"})
+            continue
+        status = str(detail.get("status") or "").upper()
+        filled_size = fnum(detail.get("filled_size"))
+        avg_price = fnum(detail.get("average_filled_price")) or fnum(row.get("limit_price"))
+        side = str(row.get("side", detail.get("side", ""))).upper()
+        product_id = str(row.get("product_id") or detail.get("product_id"))
+        event.update({"status": status, "filled_size": filled_size, "avg_price": avg_price})
+        if status == "FILLED" and filled_size > 0 and avg_price > 0:
+            if side == "BUY":
+                if not any(p.get("entry_order_id") == row["order_id"] for p in positions):
+                    positions.append({
+                        "product_id": product_id,
+                        "entry_price": avg_price,
+                        "quote_size": fnum(detail.get("total_value_after_fees")) or fnum(detail.get("filled_value")) or fnum(row.get("quote_size")),
+                        "base_size_est": filled_size,
+                        "opened_at": detail.get("last_fill_time") or detail.get("created_time") or event["ts"],
+                        "high_water_price": avg_price,
+                        "high_water_pnl_pct": 0.0,
+                        "entry_candle_low": fnum(row.get("entry_candle_low")) or avg_price,
+                        "entry_order_id": row["order_id"],
+                        "entry_order_type": "LIMIT_POST_ONLY",
+                    })
+                state["cooldown_until"] = (utcnow() + timedelta(minutes=float(cfg["cooldown_minutes_after_trade"]))).isoformat()
+                append_jsonl(Path(cfg["trades_log_path"]), {"ts": event["ts"], "side": "BUY", "order": {"success": True, "success_response": {"order_id": row["order_id"], "product_id": product_id, "side": "BUY"}}, "order_detail": detail, "signal": row.get("signal", {}), "quote_size": row.get("quote_size"), "source": "maker_limit_reconcile"})
+                event["decision"] = "PENDING_BUY_FILLED_POSITION_OPENED"
+            elif side == "SELL":
+                reason = row.get("reason") or "LIMIT_EXIT_FILLED"
+                scale_exit_reason = str(cfg.get("scale_exit_reason", "SCALE_TAKE_PROFIT"))
+                if reason == scale_exit_reason:
+                    updated_positions = []
+                    for p in positions:
+                        if p.get("product_id") == product_id:
+                            updated = apply_partial_exit_fill(p, filled_size, event["ts"])
+                            if updated:
+                                updated_positions.append(updated)
+                        else:
+                            updated_positions.append(p)
+                    positions = updated_positions
+                    append_jsonl(Path(cfg["trades_log_path"]), {"ts": event["ts"], "side": "SELL", "reason": reason, "order": {"success": True, "success_response": {"order_id": row["order_id"], "product_id": product_id, "side": "SELL"}}, "order_detail": detail, "position": row.get("position", {}), "base_size": filled_size, "source": "maker_limit_reconcile"})
+                    event["decision"] = "PENDING_PARTIAL_SELL_FILLED_POSITION_REDUCED"
+                else:
+                    positions = [p for p in positions if p.get("product_id") != product_id]
+                    if reason in {"STOP_LOSS", "SOFT_INVALIDATION", "TRAILING_STOP", "BREAKEVEN_LOCK"}:
+                        set_product_cooldown(state, product_id, float(cfg.get("per_product_cooldown_minutes_after_stop", 720)))
+                    else:
+                        set_product_cooldown(state, product_id, float(cfg.get("per_product_cooldown_minutes_after_trade", 180)))
+                    append_jsonl(Path(cfg["trades_log_path"]), {"ts": event["ts"], "side": "SELL", "reason": reason, "order": {"success": True, "success_response": {"order_id": row["order_id"], "product_id": product_id, "side": "SELL"}}, "order_detail": detail, "position": row.get("position", {}), "source": "maker_limit_reconcile"})
+                    event["decision"] = "PENDING_SELL_FILLED_POSITION_CLOSED"
+            events.append(event)
+            continue
+        if status in {"CANCELLED", "EXPIRED", "FAILED", "REJECTED"}:
+            event["decision"] = f"PENDING_{status}"
+            events.append(event)
+            continue
+        created = _parse_iso(str(row.get("placed_at") or detail.get("created_time") or ""))
+        age_min = ((utcnow() - created).total_seconds() / 60) if created else 0
+        if timeout_min > 0 and age_min > timeout_min:
+            try:
+                event["cancel"] = cancel_order(str(row["order_id"]))
+                event["decision"] = "PENDING_CANCEL_REQUESTED_TIMEOUT"
+            except Exception as exc:
+                row["last_cancel_error"] = str(exc)[:240]
+                remaining.append(row)
+                event["decision"] = "PENDING_CANCEL_ERROR"
+            events.append(event)
+            continue
+        row.update({"last_status": status, "last_reconciled_at": event["ts"], "filled_size": filled_size, "average_filled_price": avg_price})
+        remaining.append(row)
+        events.append({**event, "decision": "PENDING_STILL_OPEN"})
+    state["pending_orders"] = remaining
+    persist_positions(state, positions)
+    if events:
+        state["last_pending_order_events"] = events[-5:]
+    return events
+
+
+def should_use_maker_limit(cfg: dict[str, Any], side: str, reason: str | None = None) -> bool:
+    if not cfg.get("maker_limit_enabled", False):
+        return False
+    if side.upper() == "SELL" and cfg.get("maker_limit_use_market_for_risk_exits", True):
+        if reason in set(cfg.get("maker_limit_risk_exit_reasons", ["STOP_LOSS", "SOFT_INVALIDATION"])):
+            return False
+    return True
 
 
 def count_daily_trades(path: Path, now: datetime | None = None) -> int:
@@ -1195,7 +1495,12 @@ def set_product_cooldown(state: dict[str, Any], product_id: str, minutes: float)
 
 
 def trailing_exit_reason(cfg: dict[str, Any], pos: dict[str, Any], current: float, entry: float) -> str | None:
-    "Update high-water marks and return TRAILING_STOP when active drawdown fires."
+    """Update high-water marks and return breakeven/trailing exit reasons.
+
+    Fee-aware profile:
+    - once price reaches +2.0% gross, lock a +1.2% gross floor
+    - once price reaches +4.0% gross, trail by 2.0%
+    """
     if not cfg.get("trailing_stop_enabled", False) or entry <= 0 or current <= 0:
         return None
     pnl_pct = (current - entry) / entry
@@ -1204,11 +1509,93 @@ def trailing_exit_reason(cfg: dict[str, Any], pos: dict[str, Any], current: floa
         pos["high_water_price"] = high
         pos["high_water_pnl_pct"] = (high - entry) / entry
     high_pnl = fnum(pos.get("high_water_pnl_pct"), pnl_pct)
-    activation = float(cfg.get("trailing_activation_pct", 0.035))
-    drawdown = float(cfg.get("trailing_drawdown_pct", 0.015))
+    if cfg.get("breakeven_lock_enabled", False):
+        be_activation = float(cfg.get("breakeven_activation_pct", 0.02))
+        be_lock = float(cfg.get("breakeven_lock_pct", 0.012))
+        if high_pnl >= be_activation and pnl_pct <= be_lock:
+            return "BREAKEVEN_LOCK"
+    activation = float(cfg.get("trailing_activation_pct", 0.04))
+    drawdown = float(cfg.get("trailing_drawdown_pct", 0.02))
     if high_pnl >= activation and pnl_pct <= high_pnl - drawdown:
         return "TRAILING_STOP"
     return None
+
+
+def structural_exit_reason(cfg: dict[str, Any], pos: dict[str, Any], current: float, entry: float) -> str | None:
+    """Return SOFT_INVALIDATION for structural 15m breakdown or hard cap.
+
+    This replaces a naked fixed soft-stop: exit if the latest 15m close loses
+    the entry candle low or EMA21 while the trade is red, with a -2% hard cap.
+    """
+    if entry <= 0 or current <= 0:
+        return None
+    pnl_pct = (current - entry) / entry
+    soft_cfg = cfg.get("soft_invalidation", {}) if isinstance(cfg.get("soft_invalidation"), dict) else {}
+    hard_cap = float(soft_cfg.get("hard_cap_pct", cfg.get("soft_invalidation_pct", 0.02)))
+    if pnl_pct <= -hard_cap:
+        return "SOFT_INVALIDATION"
+    if pnl_pct >= 0:
+        return None
+    try:
+        candles = fetch_candles(str(pos.get("product_id")), cfg.get("bar_exec", "FIFTEEN_MINUTE"), 8)
+        closes = [fnum(c.get("close")) for c in candles if fnum(c.get("close")) > 0]
+        lows = [fnum(c.get("low")) for c in candles if fnum(c.get("low")) > 0]
+        if len(closes) < 21:
+            return None
+        latest_close = closes[-1]
+        entry_low = fnum(pos.get("entry_candle_low"))
+        if not entry_low and lows:
+            entry_low = min(lows[-4:])
+        ema21 = ema(closes[-80:], 21)
+        if soft_cfg.get("exit_on_15m_close_below_entry_candle_low", True) and entry_low > 0 and latest_close < entry_low:
+            pos["last_structural_invalidation"] = {"latest_close": latest_close, "entry_candle_low": entry_low, "ema21": ema21}
+            return "SOFT_INVALIDATION"
+        if soft_cfg.get("exit_on_15m_loss_of_ema21", True) and ema21 > 0 and latest_close < ema21:
+            pos["last_structural_invalidation"] = {"latest_close": latest_close, "entry_candle_low": entry_low, "ema21": ema21}
+            return "SOFT_INVALIDATION"
+    except Exception as exc:
+        pos["last_structural_invalidation_error"] = str(exc)[:160]
+    return None
+
+
+def scale_exit_plan(cfg: dict[str, Any], pos: dict[str, Any], current: float, entry: float, base_size: float) -> tuple[str | None, float]:
+    """Return a one-time partial take-profit exit when staged exits are enabled.
+
+    The first scale exit sells a configured fraction at +N% and leaves the
+    remaining position open for trailing/breakeven/soft/full-take-profit exits.
+    """
+    if not cfg.get("scale_exit_enabled", False) or entry <= 0 or current <= 0 or base_size <= 0:
+        return None, base_size
+    if pos.get("scale_exit_done") or pos.get("scale_exit_pending_order_id"):
+        return None, base_size
+    trigger = float(cfg.get("scale_exit_take_profit_pct", 0.04))
+    pnl_pct = (current - entry) / entry
+    if pnl_pct < trigger:
+        return None, base_size
+    fraction = max(0.0, min(float(cfg.get("scale_exit_fraction", 0.5)), 1.0))
+    exit_size = base_size * fraction
+    if exit_size <= 0 or exit_size >= base_size:
+        return None, base_size
+    return str(cfg.get("scale_exit_reason", "SCALE_TAKE_PROFIT")), exit_size
+
+
+def apply_partial_exit_fill(pos: dict[str, Any], filled_size: float, ts: str | None = None) -> dict[str, Any] | None:
+    """Reduce local position size after a filled staged/partial exit."""
+    current_size = fnum(pos.get("base_size_est"))
+    if current_size <= 0:
+        return None
+    remaining_size = max(0.0, current_size - max(0.0, filled_size))
+    if remaining_size <= current_size * 0.05:
+        return None
+    updated = dict(pos)
+    ratio = remaining_size / current_size
+    updated["base_size_est"] = remaining_size
+    if fnum(updated.get("quote_size")) > 0:
+        updated["quote_size"] = fnum(updated.get("quote_size")) * ratio
+    updated["scale_exit_done"] = True
+    updated["scale_exit_filled_at"] = ts or utcnow().isoformat()
+    updated.pop("scale_exit_pending_order_id", None)
+    return updated
 
 
 def choose_entry_signal(cfg: dict[str, Any], signals: list[Signal], positions: list[dict[str, Any]], state: dict[str, Any] | None = None) -> Signal | None:
@@ -1236,6 +1623,7 @@ def choose_entry_signal(cfg: dict[str, Any], signals: list[Signal], positions: l
 
 
 def run(cfg: dict[str, Any], *, status: bool=False, live: bool=False) -> dict[str, Any]:
+    load_dotenv(str(ROOT / "secrets" / "rpc_providers.env"))
     load_dotenv(cfg.get("env_file", ROOT / ".env"))
     context_cache = _load_context_cache(cfg)
     signals = [score_product(cfg, p) for p in cfg["allowed_products"]]
@@ -1282,10 +1670,18 @@ def run(cfg: dict[str, Any], *, status: bool=False, live: bool=False) -> dict[st
     cooldown_until = state.get("cooldown_until")
     in_cooldown = cooldown_until and cooldown_until > utcnow().isoformat()
     daily_trades = count_daily_trades(Path(cfg["trades_log_path"]))
+    pending_events = reconcile_pending_orders(cfg, state, balances) if balances else []
+    if pending_events:
+        result["pending_order_events"] = pending_events
     positions = normalize_positions(state)
+    pending_orders = normalize_pending_orders(state)
     max_positions = int(cfg.get("max_open_positions", 1))
     result["daily_trades_used"] = daily_trades
     result["open_positions"] = positions
+    result["pending_orders"] = pending_orders
+
+    if pending_orders and not status:
+        result["decision"] = "PENDING_ORDER_OPEN"
 
     if status and positions:
         enriched_positions = []
@@ -1306,7 +1702,7 @@ def run(cfg: dict[str, Any], *, status: bool=False, live: bool=False) -> dict[st
 
     # First priority: manage exits for existing bot-opened positions. Only one
     # live order is sent per run, so exits take precedence over new entries.
-    if positions and not status:
+    if positions and not status and result["decision"] != "PENDING_ORDER_OPEN":
         updated_positions: list[dict[str, Any]] = []
         for pos in positions:
             pos_product = str(pos.get("product_id"))
@@ -1316,42 +1712,66 @@ def run(cfg: dict[str, Any], *, status: bool=False, live: bool=False) -> dict[st
             base_size = min(fnum(pos.get("base_size_est")), balances.get(base, 0.0))
             pnl_pct = ((current - entry) / entry) if entry > 0 and current > 0 else 0.0
             sell_reason = None
-            if pnl_pct >= float(cfg["take_profit_pct"]):
+            exit_base_size = base_size
+            scale_reason, scale_size = scale_exit_plan(cfg, pos, current, entry, base_size)
+            if scale_reason:
+                sell_reason = scale_reason
+                exit_base_size = scale_size
+            elif pnl_pct >= float(cfg["take_profit_pct"]):
                 sell_reason = "TAKE_PROFIT"
             elif pnl_pct <= -float(cfg["stop_loss_pct"]):
                 sell_reason = "STOP_LOSS"
-            elif pnl_pct <= -float(cfg["soft_invalidation_pct"]):
-                try:
-                    pos_signal = apply_context_scores(cfg, score_product(cfg, pos_product), context_cache)
-                    if pos_signal.risk_block or int(pos_signal.final_score or pos_signal.score) < int(cfg.get("final_score_threshold", cfg["score_threshold"])):
-                        sell_reason = "SOFT_INVALIDATION"
+            else:
+                structural_reason = structural_exit_reason(cfg, pos, current, entry)
+                if structural_reason:
+                    sell_reason = structural_reason
+                    try:
+                        pos_signal = apply_context_scores(cfg, score_product(cfg, pos_product), context_cache)
                         result["position_signal"] = pos_signal.__dict__
-                except Exception as e:
-                    result["position_signal_error"] = str(e)[:200]
+                    except Exception as e:
+                        result["position_signal_error"] = str(e)[:200]
             trailing_reason = trailing_exit_reason(cfg, pos, current, entry)
             if trailing_reason and not sell_reason:
                 sell_reason = trailing_reason
             enriched = {**pos, "current_price": current, "pnl_pct": pnl_pct}
-            if sell_reason and base_size > 0:
+            if sell_reason and exit_base_size > 0:
                 result["open_position"] = enriched
-                result["proposed_order"] = {"product_id": pos_product, "side": "SELL", "base_size": base_size, "reason": sell_reason}
-                result["preview"] = preview_market(pos_product, "SELL", base_size=base_size)
+                use_limit = should_use_maker_limit(cfg, "SELL", sell_reason)
+                limit_price = maker_limit_price(cfg, pos_product, "SELL", current) if use_limit else None
+                result["proposed_order"] = {"product_id": pos_product, "side": "SELL", "base_size": exit_base_size, "reason": sell_reason, "order_type": "LIMIT_POST_ONLY" if use_limit else "MARKET_IOC", "limit_price": limit_price}
+                result["preview"] = preview_limit(pos_product, "SELL", limit_price, base_size=exit_base_size, post_only=bool(cfg.get("maker_limit_post_only", True))) if use_limit else preview_market(pos_product, "SELL", base_size=exit_base_size)
                 gate = live_gates_open(cfg, live)
                 if gate:
                     result["decision"] = gate
                     updated_positions.append(pos)
                 else:
-                    order = place_market(pos_product, "SELL", base_size=base_size)
+                    order = place_limit(pos_product, "SELL", limit_price, base_size=exit_base_size, post_only=bool(cfg.get("maker_limit_post_only", True))) if use_limit else place_market(pos_product, "SELL", base_size=exit_base_size)
                     result["order"] = order
                     if order.get("success") is True:
-                        result["decision"] = "ORDER_SENT"
-                        state["cooldown_until"] = (utcnow() + timedelta(minutes=float(cfg["cooldown_minutes_after_trade"]))).isoformat()
-                        if sell_reason in {"STOP_LOSS", "SOFT_INVALIDATION", "TRAILING_STOP"}:
-                            set_product_cooldown(state, pos_product, float(cfg.get("per_product_cooldown_minutes_after_stop", 720)))
+                        oid = order_id_from_response(order)
+                        if use_limit:
+                            result["decision"] = "LIMIT_ORDER_PLACED"
+                            pending_position = dict(pos)
+                            if sell_reason == str(cfg.get("scale_exit_reason", "SCALE_TAKE_PROFIT")):
+                                pending_position["scale_exit_pending_order_id"] = oid
+                            state.setdefault("pending_orders", []).append({"order_id": oid, "product_id": pos_product, "side": "SELL", "reason": sell_reason, "base_size": exit_base_size, "limit_price": limit_price, "placed_at": result["ts"], "position": pending_position, "order_type": "LIMIT_POST_ONLY"})
+                            updated_positions.append(pending_position if sell_reason == str(cfg.get("scale_exit_reason", "SCALE_TAKE_PROFIT")) else pos)
                         else:
-                            set_product_cooldown(state, pos_product, float(cfg.get("per_product_cooldown_minutes_after_trade", 180)))
-                        append_jsonl(Path(cfg["trades_log_path"]), {"ts": result["ts"], "side": "SELL", "reason": sell_reason, "order": order, "position": pos})
-                        updated_positions.extend(p for p in positions if p is not pos)
+                            scale_exit_reason = str(cfg.get("scale_exit_reason", "SCALE_TAKE_PROFIT"))
+                            if sell_reason == scale_exit_reason:
+                                result["decision"] = "PARTIAL_EXIT_SENT"
+                                updated = apply_partial_exit_fill(pos, exit_base_size, result["ts"])
+                                if updated:
+                                    updated_positions = [updated if p is pos else p for p in positions]
+                            else:
+                                result["decision"] = "ORDER_SENT"
+                                state["cooldown_until"] = (utcnow() + timedelta(minutes=float(cfg["cooldown_minutes_after_trade"]))).isoformat()
+                                if sell_reason in {"STOP_LOSS", "SOFT_INVALIDATION", "TRAILING_STOP", "BREAKEVEN_LOCK"}:
+                                    set_product_cooldown(state, pos_product, float(cfg.get("per_product_cooldown_minutes_after_stop", 720)))
+                                else:
+                                    set_product_cooldown(state, pos_product, float(cfg.get("per_product_cooldown_minutes_after_trade", 180)))
+                                updated_positions = [p for p in positions if p is not pos]
+                            append_jsonl(Path(cfg["trades_log_path"]), {"ts": result["ts"], "side": "SELL", "reason": sell_reason, "order": order, "position": pos, "base_size": exit_base_size, "order_type": "MARKET_IOC"})
                     else:
                         result["decision"] = "ORDER_FAILED"
                         updated_positions.append(pos)
@@ -1386,38 +1806,48 @@ def run(cfg: dict[str, Any], *, status: bool=False, live: bool=False) -> dict[st
         else:
             quote_size = dynamic_quote_size(cfg, quote_bal, entry_signal)
             result["entry_signal"] = entry_signal.__dict__
-            result["proposed_order"] = {"product_id": entry_signal.product_id, "side": "BUY", "quote_size": quote_size}
+            use_limit = should_use_maker_limit(cfg, "BUY")
+            limit_price = maker_limit_price(cfg, entry_signal.product_id, "BUY", entry_signal.price) if use_limit else None
+            result["proposed_order"] = {"product_id": entry_signal.product_id, "side": "BUY", "quote_size": quote_size, "order_type": "LIMIT_POST_ONLY" if use_limit else "MARKET_IOC", "limit_price": limit_price}
             if quote_size < float(cfg["min_quote_balance_to_trade"]):
                 result["decision"] = "ORDER_TOO_SMALL"
             else:
-                preview = preview_market(entry_signal.product_id, "BUY", quote_size=quote_size)
+                preview = preview_limit(entry_signal.product_id, "BUY", limit_price, quote_size=quote_size, post_only=bool(cfg.get("maker_limit_post_only", True))) if use_limit else preview_market(entry_signal.product_id, "BUY", quote_size=quote_size)
                 result["preview"] = preview
                 gate = live_gates_open(cfg, live)
                 if gate:
                     result["decision"] = gate
                 else:
-                    order = place_market(entry_signal.product_id, "BUY", quote_size=quote_size)
+                    order = place_limit(entry_signal.product_id, "BUY", limit_price, quote_size=quote_size, post_only=bool(cfg.get("maker_limit_post_only", True))) if use_limit else place_market(entry_signal.product_id, "BUY", quote_size=quote_size)
                     result["order"] = order
                     if order.get("success") is True:
-                        result["decision"] = "ORDER_SENT"
-                        state["cooldown_until"] = (utcnow() + timedelta(minutes=float(cfg["cooldown_minutes_after_trade"]))).isoformat()
-                        positions.append({
-                            "product_id": entry_signal.product_id,
-                            "entry_price": entry_signal.price,
-                            "quote_size": quote_size,
-                            "base_size_est": quote_size / entry_signal.price if entry_signal.price > 0 else 0.0,
-                            "opened_at": result["ts"],
-                            "high_water_price": entry_signal.price,
-                            "high_water_pnl_pct": 0.0,
-                        })
-                        persist_positions(state, positions)
-                        append_jsonl(Path(cfg["trades_log_path"]), {"ts": result["ts"], "side": "BUY", "order": order, "signal": entry_signal.__dict__, "quote_size": quote_size})
+                        if use_limit:
+                            oid = order_id_from_response(order)
+                            entry_low = min([fnum(c.get("low")) for c in fetch_candles(entry_signal.product_id, cfg.get("bar_exec", "FIFTEEN_MINUTE"), 4)[-4:] if fnum(c.get("low")) > 0] or [entry_signal.price])
+                            result["decision"] = "LIMIT_ORDER_PLACED"
+                            state.setdefault("pending_orders", []).append({"order_id": oid, "product_id": entry_signal.product_id, "side": "BUY", "quote_size": quote_size, "limit_price": limit_price, "placed_at": result["ts"], "signal": entry_signal.__dict__, "entry_candle_low": entry_low, "order_type": "LIMIT_POST_ONLY"})
+                        else:
+                            result["decision"] = "ORDER_SENT"
+                            state["cooldown_until"] = (utcnow() + timedelta(minutes=float(cfg["cooldown_minutes_after_trade"]))).isoformat()
+                            positions.append({
+                                "product_id": entry_signal.product_id,
+                                "entry_price": entry_signal.price,
+                                "quote_size": quote_size,
+                                "base_size_est": quote_size / entry_signal.price if entry_signal.price > 0 else 0.0,
+                                "opened_at": result["ts"],
+                                "high_water_price": entry_signal.price,
+                                "high_water_pnl_pct": 0.0,
+                                "entry_candle_low": min([fnum(c.get("low")) for c in fetch_candles(entry_signal.product_id, cfg.get("bar_exec", "FIFTEEN_MINUTE"), 4)[-4:] if fnum(c.get("low")) > 0] or [entry_signal.price]),
+                            })
+                            persist_positions(state, positions)
+                            append_jsonl(Path(cfg["trades_log_path"]), {"ts": result["ts"], "side": "BUY", "order": order, "signal": entry_signal.__dict__, "quote_size": quote_size, "order_type": "MARKET_IOC"})
                     else:
                         result["decision"] = "ORDER_FAILED"
                         append_jsonl(Path(cfg["trades_log_path"]), {"ts": result["ts"], "side": "BUY", "order": order, "signal": entry_signal.__dict__, "quote_size": quote_size, "failed": True})
 
     if not (status and result.get("open_positions")):
         result["open_positions"] = normalize_positions(state)
+    result["pending_orders"] = normalize_pending_orders(state)
     state["last_run_at"] = result["ts"]
     state["last_decision"] = result["decision"]
     state["last_top"] = top.__dict__

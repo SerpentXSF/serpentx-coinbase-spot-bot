@@ -1,6 +1,6 @@
 # SerpentX Coinbase USDC Spot Bot
 
-Current version: **v0.4.0-beta**
+Current version: **v0.5.0-beta**
 
 Educational Coinbase Advanced Trade **spot** bot for scanning USDC crypto pairs, rotating a watchlist, and managing risk-gated market orders.
 
@@ -35,8 +35,8 @@ context_score = news_score + market_score + social_score + whale_score + risk_pe
 Technical scoring considers:
 
 - 15-minute EMA stack alignment
-- price vs 1-hour EMA50
-- 1-hour trend alignment
+- price vs 30-minute EMA50
+- 30-minute trend alignment
 - RSI support or pullback setup
 - 24-hour momentum
 - Coinbase volume/liquidity
@@ -48,6 +48,7 @@ Optional public/free context can use:
 - Alternative.me Fear & Greed Index
 - Reddit public JSON search
 - Helius RPC for Solana mint activity when configured
+- Alchemy Solana RPC/WSS as a QuickNode replacement/fallback when configured
 
 All external sources are cached by default to reduce rate-limit pressure.
 
@@ -173,9 +174,13 @@ Keep `COINBASE_TRADING_ENABLED=0` until you intentionally enable live trading.
 
 ```text
 HELIUS_API_KEY=<OPTIONAL_HELIUS_API_KEY>
-# or
 HELIUS_RPC_URL=<OPTIONAL_HELIUS_RPC_URL>
+ALCHEMY_SOLANA_RPC_URL=<OPTIONAL_ALCHEMY_SOLANA_RPC_URL>
+ALCHEMY_SOLANA_WSS_URL=<OPTIONAL_ALCHEMY_SOLANA_WSS_URL>
+QUICKNODE_SOLANA_RPC_URL=<OPTIONAL_QUICKNODE_SOLANA_RPC_URL>
 ```
+
+The bot treats optional provider failures as fail-neutral context by default; Alchemy can be used instead of QuickNode for Solana RPC/WSS context.
 
 ## Basic usage
 
@@ -286,19 +291,21 @@ mkdir -p state logs analysis
 
 ### Linux/macOS cron
 
-Every 6 hours, rotate the watchlist and run the strategy in preview mode:
+Current SerpentX tuning uses a faster entry cadence plus a separate fast exit monitor:
 
 ```cron
-0 */6 * * * cd /path/to/serpentx-coinbase-spot-bot && /path/to/serpentx-coinbase-spot-bot/.venv/bin/python rotate_and_run.py --json >> logs/cron.log 2>&1
+# Every 90 minutes, rotate the watchlist and run the strategy in preview mode.
+0 0-23/3 * * * cd /path/to/serpentx-coinbase-spot-bot && /path/to/serpentx-coinbase-spot-bot/.venv/bin/python rotate_and_run.py --json >> logs/cron.log 2>&1
+30 1-23/3 * * * cd /path/to/serpentx-coinbase-spot-bot && /path/to/serpentx-coinbase-spot-bot/.venv/bin/python rotate_and_run.py --json >> logs/cron.log 2>&1
+
+# Every 3 minutes, check exits only.
+*/3 * * * * cd /path/to/serpentx-coinbase-spot-bot && /path/to/serpentx-coinbase-spot-bot/.venv/bin/python exit_monitor.py >> logs/exit-monitor.log 2>&1
+
+# Every 3 hours, refresh candidate forward-return stats.
+0 */3 * * * cd /path/to/serpentx-coinbase-spot-bot && /path/to/serpentx-coinbase-spot-bot/.venv/bin/python candidate_forward_backtest.py --snapshots 12 --top 3 >> logs/candidate-backtest.log 2>&1
 ```
 
-Every 15 minutes, check exits only:
-
-```cron
-*/15 * * * * cd /path/to/serpentx-coinbase-spot-bot && /path/to/serpentx-coinbase-spot-bot/.venv/bin/python exit_monitor.py >> logs/exit-monitor.log 2>&1
-```
-
-For live mode, add `--live` only after enabling the config and env gates.
+For live mode, add `--live` only after enabling the config and env gates. See `scripts/hermes-cron.example.md` for Hermes/no-agent schedule examples without any personal channel IDs.
 
 ### systemd timer / Docker / Windows Task Scheduler
 

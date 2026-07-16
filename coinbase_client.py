@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Minimal Coinbase Advanced Trade REST client for local/VPS deployments.
+Minimal Coinbase Advanced Trade REST client for Hermes/Umbrel.
 
 Security defaults:
 - Reads credentials only from environment variables or a local .env file.
@@ -10,7 +10,7 @@ Security defaults:
 
 Required env vars:
   COINBASE_API_KEY_NAME=organizations/.../apiKeys/...
-  COINBASE_API_PRIVATE_KEY='PASTE_YOUR_COINBASE_PEM_WITH_ESCAPED_NEWLINES'
+  COINBASE_API_PRIVATE_KEY='<YOUR_COINBASE_PEM_WITH_ESCAPED_NEWLINES>'
 """
 
 import argparse
@@ -20,6 +20,7 @@ import secrets
 import sys
 import time
 import uuid
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 
 import jwt
@@ -70,10 +71,36 @@ def algorithm_for(private_key) -> str:
     raise RuntimeError(f"Unsupported private key type: {type(private_key).__name__}")
 
 
+_COINBASE_TIME_OFFSET = {"value": 0.0, "checked_at": 0.0}
+
+
+def coinbase_epoch_now() -> int:
+    """Return Coinbase-aligned epoch seconds for short-lived JWT auth.
+
+    WSL/host clocks can drift after sleep or VM restarts. Coinbase JWTs are
+    short-lived, so a local clock that is materially behind the API server can
+    cause valid credentials to return 401 Unauthorized. Use Coinbase's public
+    Date header as a bounded, cached correction when skew is noticeable.
+    """
+    now = time.time()
+    if now - float(_COINBASE_TIME_OFFSET.get("checked_at") or 0) < 300:
+        return int(now + float(_COINBASE_TIME_OFFSET.get("value") or 0))
+    try:
+        resp = requests.get(BASE_URL + "/api/v3/brokerage/market/products/BTC-USDC", timeout=10)
+        server_date = resp.headers.get("Date")
+        if server_date:
+            offset = parsedate_to_datetime(server_date).timestamp() - now
+            _COINBASE_TIME_OFFSET["value"] = offset if abs(offset) > 30 else 0.0
+            _COINBASE_TIME_OFFSET["checked_at"] = now
+    except Exception:
+        _COINBASE_TIME_OFFSET["checked_at"] = now
+    return int(time.time() + float(_COINBASE_TIME_OFFSET.get("value") or 0))
+
+
 def build_jwt(method: str, path: str) -> str:
     key_name = require_env("COINBASE_API_KEY_NAME")
     private_key = load_private_key(require_env("COINBASE_API_PRIVATE_KEY"))
-    now = int(time.time())
+    now = coinbase_epoch_now()
     uri = f"{method.upper()} {BASE_HOST}{path}"
     payload = {
         "sub": key_name,
@@ -88,9 +115,9 @@ def build_jwt(method: str, path: str) -> str:
 
 def request(method: str, path: str, body: dict | None = None) -> dict:
     method = method.upper()
-    jwt_bearer = build_jwt(method, path)
+    token = build_jwt(method, path)
     headers = {
-        "Authorization": f"Bearer {jwt_bearer}",
+        "Authorization": f"Bearer {token}",
         "Content-Type": "application/json",
     }
     resp = requests.request(method, BASE_URL + path, headers=headers, json=body, timeout=30)

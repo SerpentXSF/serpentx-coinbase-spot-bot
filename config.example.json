@@ -1,25 +1,29 @@
 {
   "active_trading": false,
   "allowed_products": [
-    "SUI-USDC",
-    "SOL-USDC",
-    "NEAR-USDC",
-    "ONDO-USDC",
-    "DOGE-USDC"
+    "ALLO-USDC",
+    "CRV-USDC",
+    "DOT-USDC",
+    "BOBBOB-USDC",
+    "KAITO-USDC"
   ],
   "bar_exec": "FIFTEEN_MINUTE",
-  "bar_trend": "ONE_HOUR",
+  "bar_trend": "THIRTY_MINUTE",
   "base_url": "https://api.coinbase.com",
+  "breakeven_activation_pct": 0.03,
+  "breakeven_lock_enabled": true,
+  "breakeven_lock_pct": 0.02,
+  "candidate_backtest_cadence_minutes": 180,
   "context_cache_path": "analysis/context_scores.json",
   "context_overheated_24h_pct": 18,
-  "cooldown_minutes_after_trade": 60,
-  "daily_max_loss_pct": 0.02,
-  "daily_max_trades": 3,
+  "cooldown_minutes_after_trade": 30,
+  "daily_max_loss_pct": 0.025,
+  "daily_max_trades": 8,
   "directional_strategy": {
     "downside_indicators": [
       "15m EMA9<EMA21<EMA50",
-      "price below 1H EMA50",
-      "1H EMA20<EMA50",
+      "price below 30m EMA50",
+      "30m EMA20<EMA50",
       "RSI 32-58 while trending down",
       "24h negative momentum",
       "quote volume/liquidity",
@@ -28,8 +32,8 @@
     "enabled": true,
     "long_indicators": [
       "15m EMA9>EMA21>EMA50",
-      "price above 1H EMA50",
-      "1H EMA20>EMA50",
+      "price above 30m EMA50",
+      "30m EMA20>EMA50",
       "RSI 42-68 or trend pullback",
       "24h positive momentum",
       "quote volume/liquidity",
@@ -55,23 +59,52 @@
       "explicit risk limits for leverage, liquidation buffer, funding, and max short notional"
     ]
   },
-  "entry_rotator_cadence_minutes": 180,
+  "entry_rotator_cadence_minutes": 90,
+  "entry_trigger_mode": "5m_reclaim_ema9_after_pullback",
   "env_file": ".env",
+  "execution_mode": "maker_limit_preferred",
+  "exit_monitor_cadence_minutes": 3,
   "expected_move_range_multiplier": 4.0,
   "external_context_enabled": true,
   "fee_aware_entry_enabled": true,
   "fee_tracking": {
     "enabled": true,
-    "estimated_roundtrip_fee_pct": 0.024,
-    "notes": "Used for monitoring/math only; actual PnL should be reconciled from Coinbase fills.",
-    "observed_taker_fee_pct_per_side": 0.012
+    "estimated_roundtrip_fee_pct": 0.0155,
+    "notes": "Fee-aware update 2026-07-01: observed recent avg roundtrip cost about 1.54%, so strategy geometry assumes 1.55% until analytics proves lower realized costs.",
+    "observed_taker_fee_pct_per_side": 0.012,
+    "target_maker_roundtrip_fee_pct": 0.0155
   },
   "final_score_threshold": 5,
   "five_minute_confirmation_enabled": true,
   "five_minute_confirmation_lookback_hours": 8,
   "five_minute_confirmation_min_candles": 24,
+  "five_minute_reclaim_ema9_enabled": true,
+  "higher_timeframe_regime_gate": {
+    "disabled_reason": "User requested daily ONE_DAY regime gate removed for now on 2026-06-19.",
+    "enabled": false,
+    "granularity": "ONE_DAY",
+    "lookback_hours": 720,
+    "require_ema20_above_ema50": true,
+    "require_price_above_ema50": true
+  },
   "lookback_exec_hours": 24,
-  "lookback_trend_hours": 96,
+  "lookback_trend_hours": 48,
+  "maker_fee_verification": {
+    "enabled": true,
+    "min_roundtrips_before_trusting_geometry": 5,
+    "notes": "Fee-aware update 2026-07-01: warn when realized roundtrip cost exceeds 1.6%; do not trust older 1.0% geometry while observed costs remain elevated.",
+    "target_roundtrip_cost_pct": 0.0155,
+    "warning_roundtrip_cost_pct": 0.016
+  },
+  "maker_limit_enabled": true,
+  "maker_limit_pending_timeout_minutes": 90,
+  "maker_limit_post_only": true,
+  "maker_limit_price_offset_pct": 0.001,
+  "maker_limit_risk_exit_reasons": [
+    "STOP_LOSS",
+    "SOFT_INVALIDATION"
+  ],
+  "maker_limit_use_market_for_risk_exits": true,
   "market_context": {
     "block_if_score_lte": -2,
     "cache_ttl_seconds": 3600,
@@ -82,14 +115,14 @@
     "greed_extreme_threshold": 80,
     "provider": "coingecko_altfng_public"
   },
-  "max_account_quote_pct_per_trade": 0.02,
-  "max_open_positions": 1,
+  "max_account_quote_pct_per_trade": 0.15,
+  "max_open_positions": 2,
   "max_quote_per_trade": 20,
-  "min_avg_exec_range_pct": 0.0,
+  "min_avg_exec_range_pct": 0.012,
   "min_final_score_when_overheated": 7,
   "min_quote_balance_to_trade": 15,
   "min_quote_per_trade": 15,
-  "minimum_net_edge_pct": 0.012,
+  "minimum_net_edge_pct": 0.025,
   "mode": "preview",
   "news_context": {
     "block_if_score_lte": -2,
@@ -99,12 +132,14 @@
     "provider": "google_news_rss"
   },
   "no_averaging_down": true,
+  "order_cache_path": "analysis/order_cache.json",
   "overheated_block_pct": 100,
-  "overheated_require_context_pct": 50,
-  "overheated_size_down_pct": 20,
-  "per_product_cooldown_minutes_after_stop": 720,
-  "per_product_cooldown_minutes_after_trade": 180,
+  "overheated_require_context_pct": 35,
+  "overheated_size_down_pct": 12,
+  "per_product_cooldown_minutes_after_stop": 360,
+  "per_product_cooldown_minutes_after_trade": 120,
   "prevent_same_asset_duplicate": true,
+  "product_metadata_cache_path": "analysis/product_metadata_cache.json",
   "provider_budget_path": "state/provider_budget.json",
   "quote_currency": "USDC",
   "rsi_bearish_divergence_penalty": 1,
@@ -114,9 +149,13 @@
   "rsi_divergence_period": 14,
   "rsi_divergence_swing_window": 2,
   "runs_log_path": "logs/runs.jsonl",
+  "scale_exit_enabled": true,
+  "scale_exit_fraction": 0.5,
+  "scale_exit_reason": "SCALE_TAKE_PROFIT",
+  "scale_exit_take_profit_pct": 0.045,
   "score_threshold": 4,
-  "second_position_min_final_score": 8,
-  "second_position_min_score": 6,
+  "second_position_min_final_score": 6,
+  "second_position_min_score": 5,
   "sizing_max_score_multiplier": 1.3,
   "sizing_quote_balance_target": 100,
   "sizing_score_step_multiplier": 0.15,
@@ -130,216 +169,24 @@
     "reddit_limit": 8,
     "reddit_subreddits": "CryptoCurrency+CryptoMarkets+altcoin"
   },
-  "soft_invalidation_pct": 0.0225,
+  "soft_invalidation": {
+    "exit_on_15m_close_below_entry_candle_low": true,
+    "exit_on_15m_loss_of_ema21": true,
+    "hard_cap_pct": 0.02,
+    "mode": "structural_15m_or_hard_cap",
+    "notes": "Fee-aware target set assumes maker/limit execution around 1.0% roundtrip; actual fills still reconciled from Coinbase order details."
+  },
+  "soft_invalidation_pct": 0.02,
   "state_path": "state/state.json",
-  "stop_loss_pct": 0.04,
+  "stop_loss_pct": 0.035,
   "strategy_name": "SerpentX Coinbase Spot USDC Rotator v1",
   "strategy_scope": "coinbase_spot_long_with_dual_direction_scoring",
-  "take_profit_pct": 0.0525,
-  "token_context": {
-    "ALLO-USDC": {
-      "coingecko_id": "allora",
-      "name": "Allora",
-      "news_terms": [
-        "ALLO",
-        "Allora",
-        "Allora crypto"
-      ],
-      "social_notes": [],
-      "social_terms": [
-        "ALLO",
-        "Allora"
-      ]
-    },
-    "ENA-USDC": {
-      "coingecko_id": "ethena",
-      "name": "Ethena",
-      "news_terms": [
-        "ENA",
-        "ENA crypto",
-        "Ethena"
-      ],
-      "social_notes": [],
-      "social_terms": [
-        "ENA",
-        "Ethena"
-      ]
-    },
-    "FET-USDC": {
-      "coingecko_id": "fetch-ai",
-      "name": "Artificial Superintelligence Alliance",
-      "news_terms": [
-        "FET",
-        "ASI",
-        "Artificial Superintelligence Alliance",
-        "Fetch.ai"
-      ],
-      "social_notes": [],
-      "social_terms": [
-        "FET",
-        "ASI",
-        "Fetch.ai"
-      ]
-    },
-    "FIDA-USDC": {
-      "coingecko_id": "bonfida",
-      "name": "Bonfida",
-      "news_terms": [
-        "FIDA",
-        "Bonfida",
-        "Bonfida crypto"
-      ],
-      "social_notes": [],
-      "social_terms": [
-        "FIDA",
-        "Bonfida"
-      ]
-    },
-    "GWEI-USDC": {
-      "coingecko_id": "ethgas-2",
-      "name": "ETHGas",
-      "news_terms": [
-        "GWEI",
-        "ETHGas",
-        "GWEI crypto"
-      ],
-      "social_notes": [],
-      "social_terms": [
-        "GWEI",
-        "ETHGas"
-      ]
-    },
-    "JTO-USDC": {
-      "coingecko_id": "jito-governance-token",
-      "name": "Jito",
-      "news_terms": [
-        "JTO",
-        "Jito",
-        "Jito crypto"
-      ],
-      "social_notes": [],
-      "social_terms": [
-        "JTO",
-        "Jito"
-      ],
-      "solana_mint": "JTOjtomepa8beP8AuQc6eXt5FriJwfFMwQx2v2f9mCL"
-    },
-    "MON-USDC": {
-      "coingecko_id": "monad",
-      "name": "Monad",
-      "news_terms": [
-        "MON",
-        "Monad",
-        "Monad crypto"
-      ],
-      "social_notes": [],
-      "social_terms": [
-        "MON",
-        "Monad"
-      ]
-    },
-    "NEAR-USDC": {
-      "coingecko_id": "near",
-      "name": "NEAR Protocol",
-      "news_terms": [
-        "NEAR",
-        "NEAR crypto",
-        "NEAR Protocol"
-      ],
-      "social_notes": [],
-      "social_terms": [
-        "NEAR",
-        "NEAR Protocol"
-      ]
-    },
-    "ONDO-USDC": {
-      "coingecko_id": "ondo-finance",
-      "name": "Ondo",
-      "news_terms": [
-        "ONDO",
-        "ONDO crypto",
-        "Ondo"
-      ],
-      "social_notes": [],
-      "social_terms": [
-        "ONDO",
-        "Ondo"
-      ]
-    },
-    "OSMO-USDC": {
-      "coingecko_id": "osmosis",
-      "name": "Osmosis",
-      "news_terms": [
-        "OSMO",
-        "Osmosis",
-        "Osmosis crypto"
-      ],
-      "social_notes": [],
-      "social_terms": [
-        "OSMO",
-        "Osmosis"
-      ]
-    },
-    "TON-USDC": {
-      "coingecko_id": "the-open-network",
-      "name": "Toncoin",
-      "news_terms": [
-        "TON",
-        "Toncoin",
-        "The Open Network"
-      ],
-      "social_notes": [],
-      "social_terms": [
-        "TON",
-        "Toncoin"
-      ]
-    },
-    "VVV-USDC": {
-      "coingecko_id": "venice-token",
-      "name": "Venice Token",
-      "news_terms": [
-        "VVV",
-        "VVV crypto",
-        "Venice Token"
-      ],
-      "social_notes": [],
-      "social_terms": [
-        "VVV",
-        "Venice Token"
-      ]
-    },
-    "WLD-USDC": {
-      "coingecko_id": "worldcoin-wld",
-      "name": "Worldcoin",
-      "news_terms": [
-        "WLD",
-        "Worldcoin",
-        "World crypto"
-      ],
-      "social_notes": [],
-      "social_terms": [
-        "WLD",
-        "Worldcoin"
-      ]
-    },
-    "ZEC-USDC": {
-      "coingecko_id": "zcash",
-      "name": "Zcash",
-      "news_terms": [
-        "ZEC",
-        "ZEC crypto",
-        "Zcash"
-      ],
-      "social_notes": [],
-      "social_terms": [
-        "ZEC",
-        "Zcash"
-      ]
-    }
-  },
+  "take_profit_pct": 0.065,
+  "thirty_minute_regime_gate_enabled": true,
+  "traderjoe_recommendation_cadence_minutes": 180,
   "trades_log_path": "logs/trades.jsonl",
-  "trailing_activation_pct": 0.035,
-  "trailing_drawdown_pct": 0.015,
+  "trailing_activation_pct": 0.04,
+  "trailing_drawdown_pct": 0.018,
   "trailing_stop_enabled": true,
   "whale_context": {
     "block_if_score_lte": -2,
