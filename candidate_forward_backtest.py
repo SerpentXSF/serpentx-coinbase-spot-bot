@@ -6,11 +6,11 @@ and estimates forward 1h/3h/6h returns from Coinbase public candles. This is an
 edge-research tool only; it does not trade.
 """
 from __future__ import annotations
-import argparse, json, os, sys, time
+import argparse, json, sys, time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any
-ROOT=Path(os.getenv('COINBASE_BOT_ROOT', Path(__file__).resolve().parent)).resolve()
+ROOT=Path(os.getenv("COINBASE_BOT_ROOT", Path(__file__).resolve().parent)).resolve()
 sys.path.insert(0,str(ROOT))
 import coinbase_spot_bot as bot  # noqa: E402
 OUT=ROOT/'analysis'/'candidate_forward_returns.json'

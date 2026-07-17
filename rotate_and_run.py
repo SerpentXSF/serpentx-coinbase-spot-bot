@@ -4,7 +4,7 @@
 Safety:
 - Defaults to preview/status only.
 - Live requires --live plus existing bot gates: config active_trading=true and
-  COINBASE_TRADING_ENABLED=1 in your local .env.
+  COINBASE_TRADING_ENABLED=1 in .env.
 - Does not print secrets.
 """
 from __future__ import annotations
@@ -16,7 +16,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-ROOT = Path(os.getenv('COINBASE_BOT_ROOT', Path(__file__).resolve().parent)).resolve()
+ROOT = Path(os.getenv("COINBASE_BOT_ROOT", Path(__file__).resolve().parent)).resolve()
 CONFIG = ROOT / 'config.json'
 LATEST = ROOT / 'analysis' / 'usdc_pairs_latest.json'
 ANALYZER = ROOT / 'analyze_usdc_pairs.py'
