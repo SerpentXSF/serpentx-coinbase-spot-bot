@@ -30,8 +30,8 @@ Spot cannot create a true short position. Selling a spot asset you already hold 
 Long/upside indicators:
 
 - 15m EMA9 > EMA21 > EMA50.
-- Price above 1H EMA50.
-- 1H EMA20 > EMA50.
+- Price above 30m EMA50.
+- 30m EMA20 > EMA50.
 - RSI in supportive/trend-pullback range.
 - Positive 24h momentum.
 - Quote volume/liquidity.
@@ -40,8 +40,8 @@ Long/upside indicators:
 Downside/bear indicators:
 
 - 15m EMA9 < EMA21 < EMA50.
-- Price below 1H EMA50.
-- 1H EMA20 < EMA50.
+- Price below 30m EMA50.
+- 30m EMA20 < EMA50.
 - RSI 32-58 while trending down.
 - Negative 24h momentum.
 - Quote volume/liquidity.
