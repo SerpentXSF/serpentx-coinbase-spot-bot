@@ -25,8 +25,10 @@ sys.path.insert(0, str(ROOT))
 import coinbase_spot_bot as bot  # noqa: E402
 
 CONFIG = ROOT / 'config.json'
-STATE = ROOT / 'state.json'
-TRADES = ROOT / 'trades.jsonl'
+# Defaults match config.example.json; config.json overrides via state_path /
+# trades_log_path / runs_log_path so the dashboard reads what the bot writes.
+STATE = ROOT / 'state' / 'state.json'
+TRADES = ROOT / 'logs' / 'trades.jsonl'
 ANALYSIS = ROOT / 'analysis' / 'usdc_pairs_latest.json'
 CACHE = ROOT / 'analysis' / 'order_cache.json'
 SNAPSHOTS = ROOT / 'analysis' / 'analytics_snapshots.jsonl'
@@ -46,6 +48,13 @@ def fnum(x: Any, default: float = 0.0) -> float:
         return float(x)
     except Exception:
         return default
+
+
+def runtime_path(cfg: dict[str, Any], key: str, default: Path) -> Path:
+    value = cfg.get(key)
+    if not value:
+        return default
+    return Path(bot.resolve_runtime_paths({key: value})[key])
 
 
 def load_json(path: Path, default: Any) -> Any:
@@ -351,7 +360,7 @@ def enrich_open_positions(state: dict[str, Any], cfg: dict[str, Any]) -> list[di
 def top_next_assets(cfg: dict[str, Any], limit: int = 5) -> list[dict[str, Any]]:
     data = load_json(ANALYSIS, {})
     rows = data.get('rows') or []
-    product_cooldowns = load_json(STATE, {}).get('product_cooldowns', {})
+    product_cooldowns = load_json(runtime_path(cfg, 'state_path', STATE), {}).get('product_cooldowns', {})
     now_s = utc_now()
     out = []
     for r in rows:
@@ -409,7 +418,7 @@ def build_summary(refresh_orders: bool = True) -> dict[str, Any]:
     cfg = load_json(CONFIG, {})
     bot.load_dotenv(cfg.get('env_file', ROOT / '.env'))
     cache = load_json(CACHE, {})
-    raw_logs = read_jsonl(TRADES)
+    raw_logs = read_jsonl(runtime_path(cfg, 'trades_log_path', TRADES))
     order_rows = []
     for row in raw_logs:
         oid = order_id_from_log(row)
@@ -434,8 +443,8 @@ def build_summary(refresh_orders: bool = True) -> dict[str, Any]:
         else:
             rec['losses'] += 1
     assets = sorted(by_asset.values(), key=lambda x: x['pnl'])
-    state = load_json(STATE, {})
-    latest_run = latest_jsonl(RUNS)
+    state = load_json(runtime_path(cfg, 'state_path', STATE), {})
+    latest_run = latest_jsonl(runtime_path(cfg, 'runs_log_path', RUNS))
     open_positions = enrich_open_positions(state, cfg)
     equity_curve = []
     running = 0.0
@@ -638,8 +647,10 @@ def write_snapshot() -> dict[str, Any]:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument('--host', default='0.0.0.0')
-    ap.add_argument('--port', type=int, default=2048)
+    # Localhost by default: the dashboard shows balances and trade history and
+    # has no authentication. Pass --host 0.0.0.0 only on a trusted network.
+    ap.add_argument('--host', default='127.0.0.1', help='Bind address (default: 127.0.0.1)')
+    ap.add_argument('--port', type=int, default=8787, help='Port (default: 8787)')
     ap.add_argument('--json', action='store_true')
     ap.add_argument('--snapshot', action='store_true')
     args = ap.parse_args()

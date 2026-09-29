@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- Fixed `rotate_and_run.py` / `analyze_usdc_pairs.py` and `candidate_forward_backtest.py` crashing on startup with `NameError: name 'os' is not defined`.
+- Fixed the README quick start failing with `Coinbase private key must be PEM text` when `.env` was copied from the template but not yet filled in; placeholder credentials now count as "no credentials" and the template ships blank.
+- Fixed the dashboard reading `state.json` / `trades.jsonl` from the repo root instead of the `state/` and `logs/` paths the bot writes, so positions, cooldowns, and trades now appear.
+- Dashboard now binds to `127.0.0.1:8787` by default (was `0.0.0.0:2048`), matching the docs and keeping balances off the LAN.
+- Relative `*_path` config entries now resolve against the bot folder, so running from another directory (systemd, Task Scheduler) no longer splits state across folders.
+- One delisted or failing product no longer aborts the whole run; it is marked `ERROR` and skipped.
+- `candidate_forward_backtest.py` creates `analysis/` if missing; clear error when `config.json` is missing.
+- Added offline smoke tests for every documented command and a GitHub Actions CI workflow (Python 3.10-3.13).
+- Rewrote README install/setup into a single verified quick start with an API key walkthrough and troubleshooting table.
+
 ## v0.5.0-beta
 
 - Synced the public Spot bot with the latest live-safe strategy code, including Coinbase JWT timestamp correction for WSL/host clock drift.

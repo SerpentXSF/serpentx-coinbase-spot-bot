@@ -52,7 +52,7 @@ def _structural_exit_reason(cfg: dict[str, Any], pos: dict[str, Any], current: f
 
 
 def run(*, live: bool = False, json_status: bool = False) -> dict[str, Any]:
-    cfg = bot.load_json(CONFIG)
+    cfg = bot.load_config(CONFIG)
     bot.load_dotenv(cfg.get("env_file", ROOT / ".env"))
 
     state_path = Path(cfg["state_path"])

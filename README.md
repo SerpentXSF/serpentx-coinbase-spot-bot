@@ -18,6 +18,7 @@ Educational Coinbase Advanced Trade **spot** bot for scanning USDC crypto pairs,
 - Includes RSI bullish/bearish divergence labels, 5-minute entry confirmation, fee-aware entry guards, trailing-stop support, and stale duplicate-position cleanup.
 - Includes a local Red/Purple analytics dashboard with responsive cards, charts, snapshots, order reconciliation, and candidate follow-through metrics.
 - Defaults to preview mode; live orders require multiple explicit gates.
+- Runs in public, read-only mode with no API keys, so you can try it before creating credentials.
 
 ## Not required
 
@@ -81,12 +82,17 @@ Additional protections include:
 
 ## Requirements
 
-- Python 3.10+
-- Coinbase Advanced Trade API key
+- Python 3.10 – 3.13 (tested in CI)
+- Git
+- A Coinbase Advanced Trade / Coinbase Developer Platform (CDP) API key — **optional** for the first run; public market analysis works without one
 - API key with trading permission only if you intend to trade live
 - **No withdrawal/transfer permission** recommended
 
-## Install on Linux / macOS / WSL
+## Quick start
+
+Every command below was verified against a fresh clone. The bot runs in public, read-only mode until you add credentials, so you can confirm the install works before touching any keys.
+
+### 1. Install (Linux / macOS / WSL)
 
 ```bash
 git clone https://github.com/SerpentXSF/serpentx-coinbase-spot-bot.git
@@ -94,20 +100,20 @@ cd serpentx-coinbase-spot-bot
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 cp config.example.json config.json
 cp .env.example .env
 chmod 600 .env
 ```
 
-If your distro blocks system `pip` with PEP 668, keep using the virtual environment above, or install with `uv`:
+If your distro blocks `pip` with PEP 668 ("externally-managed-environment"), you are not inside the venv — run `source .venv/bin/activate` again. On Debian/Ubuntu, `python3 -m venv` may first need `sudo apt install python3-venv`. You can also use `uv`:
 
 ```bash
 uv venv .venv
 uv pip install --python .venv/bin/python -r requirements.txt
 ```
 
-## Install on Windows PowerShell
+### 1. Install (Windows PowerShell)
 
 ```powershell
 git clone https://github.com/SerpentXSF/serpentx-coinbase-spot-bot.git
@@ -115,72 +121,60 @@ cd serpentx-coinbase-spot-bot
 py -3 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 Copy-Item config.example.json config.json
 Copy-Item .env.example .env
 ```
 
-If PowerShell blocks activation scripts, run:
+If PowerShell blocks activation scripts, run `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`, reopen PowerShell, and activate the venv again. Windows users can also follow the Linux steps inside WSL. The `scripts/*.sh` wrappers are bash-only; on Windows call the Python scripts directly.
 
-```powershell
-Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
-```
-
-Then reopen PowerShell and activate the venv again. Windows users can also run the Linux instructions inside WSL.
-
-## Generic dependency install
-
-If you already cloned the repo and created `config.json` / `.env`, install dependencies with:
+### 2. Verify the install (no API keys needed)
 
 ```bash
-python -m pip install -r requirements.txt
+python -m unittest -v
+python coinbase_spot_bot.py --status
 ```
 
-## Setup
+The unit tests run fully offline against a fake Coinbase API. The status run fetches live public market data and should end with `Decision: STATUS_ONLY` and `Auth: missing_coinbase_credentials` — that is expected until you add keys. State, logs, and caches are written to `state/`, `logs/`, and `analysis/` inside the repo folder regardless of which directory you run from.
 
-1. Clone the repository if you did not already do so.
+### 3. Add your Coinbase API key
 
-```bash
-git clone https://github.com/SerpentXSF/serpentx-coinbase-spot-bot.git
-cd serpentx-coinbase-spot-bot
-```
-
-2. Create local config and environment files.
-
-```bash
-cp config.example.json config.json
-cp .env.example .env
-chmod 600 .env  # Linux/macOS
-```
-
-On Windows PowerShell:
-
-```powershell
-copy config.example.json config.json
-copy .env.example .env
-```
-
-3. Edit `.env` and add your own Coinbase API credentials.
+1. Create a **Secret API key** in the [Coinbase Developer Platform portal](https://portal.cdp.coinbase.com/). Choose the **ECDSA** signature algorithm — this bot loads PEM keys, and Coinbase issues Ed25519 keys in a non-PEM format. Grant *View*; add *Trade* only if you plan to go live. Never grant *Transfer*.
+2. Edit `.env`:
 
 ```text
-COINBASE_API_KEY_NAME=organizations/.../apiKeys/...
-COINBASE_API_PRIVATE_KEY="PASTE_YOUR_PEM_PRIVATE_KEY_WITH_ESCAPED_NEWLINES"
+COINBASE_API_KEY_NAME=organizations/<org-id>/apiKeys/<key-id>
+COINBASE_API_PRIVATE_KEY="-----BEGIN EC PRIVATE KEY-----\nMHc...\n-----END EC PRIVATE KEY-----\n"
 COINBASE_TRADING_ENABLED=0
 ```
 
-Keep `COINBASE_TRADING_ENABLED=0` until you intentionally enable live trading.
+The private key must be on **one line**, wrapped in double quotes, with each line break written as `\n`. Keep `COINBASE_TRADING_ENABLED=0` until you intentionally enable live trading.
 
-4. Optional: add external provider keys.
+3. Re-run `python coinbase_spot_bot.py --status`. You should now see a `Balances checked:` line instead of `Auth: missing_coinbase_credentials`.
+
+### 4. Optional: external context providers
 
 ```text
-HELIUS_API_KEY=<OPTIONAL_HELIUS_API_KEY>
-HELIUS_RPC_URL=<OPTIONAL_HELIUS_RPC_URL>
-ALCHEMY_SOLANA_RPC_URL=<OPTIONAL_ALCHEMY_SOLANA_RPC_URL>
-ALCHEMY_SOLANA_WSS_URL=<OPTIONAL_ALCHEMY_SOLANA_WSS_URL>
-QUICKNODE_SOLANA_RPC_URL=<OPTIONAL_QUICKNODE_SOLANA_RPC_URL>
+HELIUS_API_KEY=
+HELIUS_RPC_URL=
+ALCHEMY_SOLANA_RPC_URL=
+ALCHEMY_SOLANA_WSS_URL=
+QUICKNODE_SOLANA_RPC_URL=
+COINGECKO_API_KEY=
 ```
 
-The bot treats optional provider failures as fail-neutral context by default; Alchemy can be used instead of QuickNode for Solana RPC/WSS context.
+Leave blank if unused. The bot treats optional provider failures as fail-neutral context by default; Alchemy can be used instead of QuickNode for Solana RPC/WSS context.
+
+### Troubleshooting
+
+| Symptom | Fix |
+| --- | --- |
+| `Config not found: .../config.json` | `cp config.example.json config.json` (PowerShell: `Copy-Item`). |
+| `Coinbase private key must be PEM text` | The key in `.env` must start with `-----BEGIN` and use `\n` for line breaks, all on one line in double quotes. |
+| `401 Unauthorized` on private calls | Check the key name is the full `organizations/.../apiKeys/...` string, the key is not revoked/IP-restricted, and your system clock is correct (the bot auto-corrects drift over 30 s). |
+| `Decision: NEEDS_CREDENTIALS_FOR_PREVIEW_OR_TRADE` | Normal without keys: order previews use a private Coinbase endpoint. |
+| `LIVE_BLOCKED_...` decisions | A live gate is still closed — see [Safety design](#safety-design). This is working as intended. |
+| One product shows `action: ERROR` | That product was delisted/renamed or its candles failed; the rest of the watchlist still runs. `rotate_and_run.py` refreshes the list. |
 
 ## Basic usage
 
@@ -202,7 +196,7 @@ python coinbase_spot_bot.py --config config.json
 
 ### Rotate watchlist and run preview
 
-Scans Coinbase USDC pairs, writes the top 5 to `config.json`, then runs the bot in preview mode.
+Scans Coinbase USDC pairs, writes the top 5 to `allowed_products` in your `config.json` (other settings are preserved), then runs the bot in preview mode.
 
 ```bash
 python rotate_and_run.py --json
@@ -231,10 +225,10 @@ The monitor stays quiet on normal hold/no-position ticks unless `--json` is supp
 Run a local, read-only dashboard from your own bot state/log files. The dashboard includes responsive dark Red/Purple styling, balances/position cards, SVG charts, recent run/trade tables, candidate snapshots, forward-return summaries, and optional order reconciliation data.
 
 ```bash
-python trade_analytics_dashboard.py --host 127.0.0.1 --port 8787
+python trade_analytics_dashboard.py
 ```
 
-Then open:
+It binds to `127.0.0.1:8787` by default (override with `--host` / `--port`). Then open:
 
 ```text
 http://127.0.0.1:8787
@@ -327,6 +321,8 @@ scripts/*.sh              Portable shell wrappers for cron/systemd
 config.example.json       Safe default config template
 .env.example              Secret template; copy to .env locally
 requirements.txt          Python dependencies
+test_*.py                 Unit tests + offline smoke tests (python -m unittest)
+.github/workflows/ci.yml  CI: runs the tests on Python 3.10-3.13
 ```
 
 ## What not to commit
@@ -357,8 +353,8 @@ Use the least permissions required:
 ## Development checks
 
 ```bash
-python -m py_compile coinbase_spot_bot.py analyze_usdc_pairs.py rotate_and_run.py exit_monitor.py coinbase_client.py trade_analytics_dashboard.py candidate_forward_backtest.py
+python -m unittest -v
 python coinbase_spot_bot.py --config config.example.json --status
 ```
 
-The second command may use public endpoints and optional providers. Private account checks require your local `.env`.
+The unit tests include offline smoke tests (`test_offline_smoke.py`) that run every documented command against a fake Coinbase API, so they need no network or keys. GitHub Actions runs them on Python 3.10–3.13 for every push and pull request. The second command uses live public endpoints and optional providers; private account checks require your local `.env`.

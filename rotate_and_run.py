@@ -43,6 +43,10 @@ def main() -> int:
     ap.add_argument('--json', action='store_true')
     args = ap.parse_args()
 
+    if not CONFIG.exists():
+        print(f'ERROR: {CONFIG} not found. Create it with: cp config.example.json config.json', file=sys.stderr)
+        return 2
+
     analysis_proc = run([sys.executable, str(ANALYZER)])
     if analysis_proc.returncode != 0:
         print('ERROR: analyzer failed', file=sys.stderr)

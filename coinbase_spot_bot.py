@@ -62,6 +62,27 @@ def load_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text())
 
 
+def resolve_runtime_paths(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Anchor relative ``*_path`` / ``env_file`` config entries to the bot folder.
+
+    Without this, state, logs, and caches land in whatever directory the
+    scheduler happens to start in (for example ``/`` under systemd or Task
+    Scheduler), which silently splits bot state across folders.
+    """
+    out = dict(cfg)
+    for key, value in cfg.items():
+        if (key.endswith("_path") or key == "env_file") and isinstance(value, str) and value and not Path(value).is_absolute():
+            out[key] = str(ROOT / value)
+    return out
+
+
+def load_config(path: str | Path) -> dict[str, Any]:
+    p = Path(path)
+    if not p.exists():
+        raise RuntimeError(f"Config not found: {p}. Create it with: cp config.example.json config.json")
+    return resolve_runtime_paths(load_json(p))
+
+
 def save_json(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -161,10 +182,20 @@ def load_dotenv(path: str | Path) -> None:
         os.environ.setdefault(key, value)
 
 
+# Markers used by .env.example placeholders. A copied-but-unedited template must
+# behave like "no credentials" instead of crashing on an invalid PEM.
+_PLACEHOLDER_MARKERS = ("YOUR_ORG_ID", "YOUR_KEY_ID", "PASTE_YOUR", "<YOUR_", "<OPTIONAL_")
+
+
+def real_env(name: str) -> bool:
+    val = os.getenv(name) or ""
+    return bool(val.strip()) and not any(m in val for m in _PLACEHOLDER_MARKERS)
+
+
 def env_present() -> dict[str, bool]:
     return {
-        "COINBASE_API_KEY_NAME": bool(os.getenv("COINBASE_API_KEY_NAME")),
-        "COINBASE_API_PRIVATE_KEY": bool(os.getenv("COINBASE_API_PRIVATE_KEY")),
+        "COINBASE_API_KEY_NAME": real_env("COINBASE_API_KEY_NAME"),
+        "COINBASE_API_PRIVATE_KEY": real_env("COINBASE_API_PRIVATE_KEY"),
         "COINBASE_TRADING_ENABLED": os.getenv("COINBASE_TRADING_ENABLED") == "1",
         "HELIUS_API_KEY": bool(os.getenv("HELIUS_API_KEY")),
         "HELIUS_RPC_URL": bool(os.getenv("HELIUS_RPC_URL") or os.getenv("HELIUS_GATEKEEPER_RPC_URL")),
@@ -1081,6 +1112,21 @@ def score_product(cfg: dict[str, Any], product_id: str) -> Signal:
     return sig
 
 
+def safe_score_product(cfg: dict[str, Any], product_id: str) -> Signal:
+    """Score one product without letting a single bad symbol abort the run.
+
+    A delisted/renamed product or a transient candle error for one symbol should
+    not block exit management or entries for the rest of the watchlist.
+    """
+    try:
+        return score_product(cfg, product_id)
+    except Exception as exc:
+        s = Signal(product_id, 0.0, 0, "ERROR", [f"scoring failed: {str(exc)[:160]}"], 50.0, 0.0, 0.0)
+        s.risk_block = True
+        s.final_score = -99
+        return s
+
+
 def get_accounts() -> dict[str, Any]:
     # Request a larger page and keep query params out of the JWT URI. Coinbase
     # rejects tokens signed with the query string included in the uri claim.
@@ -1626,8 +1672,10 @@ def run(cfg: dict[str, Any], *, status: bool=False, live: bool=False) -> dict[st
     load_dotenv(str(ROOT / "secrets" / "rpc_providers.env"))
     load_dotenv(cfg.get("env_file", ROOT / ".env"))
     context_cache = _load_context_cache(cfg)
-    signals = [score_product(cfg, p) for p in cfg["allowed_products"]]
-    signals = [apply_context_scores(cfg, s, context_cache) for s in signals]
+    signals = [safe_score_product(cfg, p) for p in cfg["allowed_products"]]
+    if not signals:
+        raise RuntimeError("config allowed_products is empty; run rotate_and_run.py or add products to config.json")
+    signals = [s if s.action == "ERROR" else apply_context_scores(cfg, s, context_cache) for s in signals]
     _save_context_cache(cfg, context_cache)
     signals.sort(key=lambda s: (s.final_score or s.score, s.score, s.change_24h, s.quote_volume), reverse=True)
     top = signals[0]
@@ -1880,7 +1928,7 @@ def main() -> None:
     ap.add_argument("--live", action="store_true", help="Attempt live order if all gates allow it")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
-    cfg = load_json(Path(args.config))
+    cfg = load_config(args.config)
     result = run(cfg, status=args.status, live=args.live)
     print(json.dumps(result, indent=2, sort_keys=True) if args.json else summarize(result))
 

@@ -6,7 +6,7 @@ and estimates forward 1h/3h/6h returns from Coinbase public candles. This is an
 edge-research tool only; it does not trade.
 """
 from __future__ import annotations
-import argparse, json, sys, time
+import argparse, json, os, sys, time
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any
@@ -71,6 +71,7 @@ def main()->int:
         summary.append({'product_id':p,'samples':len(rs),'avg_1h_pct':avg([x.get('return_1h_pct') for x in rs]),'avg_3h_pct':avg([x.get('return_3h_pct') for x in rs]),'avg_6h_pct':avg([x.get('return_6h_pct') for x in rs])})
     summary.sort(key=lambda x:(x.get('avg_6h_pct') is not None, x.get('avg_6h_pct') or -999), reverse=True)
     out={'generated_at':datetime.now(timezone.utc).isoformat(),'snapshots_analyzed':len(files),'rows':rows,'by_product':summary}
+    OUT.parent.mkdir(parents=True, exist_ok=True)
     OUT.write_text(json.dumps(out,indent=2)+'\n')
     print(json.dumps({'generated_at':out['generated_at'],'samples':len(rows),'top_by_6h':summary[:5]},indent=2))
     return 0
