@@ -172,6 +172,21 @@ class OfflineSmokeTests(unittest.TestCase):
         self.assertTrue((self.root / "state" / "state.json").exists())
         self.assertFalse((elsewhere / "state").exists())
 
+    def test_overlapping_runs_are_skipped_not_doubled(self) -> None:
+        lock = self.root / "state" / "run.lock"
+        lock.parent.mkdir()
+        lock.write_text("{}")  # fresh lock held by "another" run
+        proc = self.run_script("coinbase_spot_bot.py", "--json")
+        self.assertOk(proc)
+        self.assertEqual(json.loads(proc.stdout)["decision"], "SKIPPED_RUN_LOCKED")
+        self.assertOk(self.run_script("exit_monitor.py"))
+        self.assertTrue(lock.exists())
+
+    def test_client_cli_uses_shared_auth(self) -> None:
+        proc = self.run_script("coinbase_client.py", "accounts")
+        self.assertEqual(proc.returncode, 1)
+        self.assertIn("Missing required env var: COINBASE_API_KEY_NAME", proc.stderr)
+
     def test_rotator_preview(self) -> None:
         proc = self.run_script("rotate_and_run.py", "--json")
         self.assertOk(proc)

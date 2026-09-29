@@ -11,6 +11,14 @@
 - `candidate_forward_backtest.py` creates `analysis/` if missing; clear error when `config.json` is missing.
 - Added offline smoke tests for every documented command and a GitHub Actions CI workflow (Python 3.10-3.13).
 - Rewrote README install/setup into a single verified quick start with an API key walkthrough and troubleshooting table.
+- Fixed exits silently deleting other open positions from state: when the first position fired an exit that was not a full market close (preview mode, failed order, limit order, partial exit), every position after it was dropped and lost stop-loss management. Affects both the bot and the exit monitor.
+- Market orders now record Coinbase's actual fill (average price, size, fees) for entry price and realized P&L instead of the signal price.
+- `daily_max_loss_pct` is now enforced: new entries stop for the rest of the UTC day once realized losses reach the limit; exits keep running.
+- Added a shared run lock so the rotator/bot and exit monitor never trade on the same state concurrently.
+- Rotator timeouts are configurable (`rotator_analyzer_timeout_seconds`, `rotator_bot_timeout_seconds`) and fail with a clear message.
+- Runs print which live gates are open, with a stderr banner when all three are.
+- `coinbase_client.py` now reuses the bot's auth/request code instead of a divergent copy.
+- Pinned dependency major versions; default watchlist switched to liquid pairs (BTC, ETH, SOL, LINK, DOGE).
 
 ## v0.5.0-beta
 

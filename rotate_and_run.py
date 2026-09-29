@@ -47,7 +47,14 @@ def main() -> int:
         print(f'ERROR: {CONFIG} not found. Create it with: cp config.example.json config.json', file=sys.stderr)
         return 2
 
-    analysis_proc = run([sys.executable, str(ANALYZER)])
+    cfg = load_json(CONFIG)
+    analyzer_timeout = float(cfg.get('rotator_analyzer_timeout_seconds', 90))
+    bot_timeout = float(cfg.get('rotator_bot_timeout_seconds', 120))
+    try:
+        analysis_proc = run([sys.executable, str(ANALYZER)], timeout=analyzer_timeout)
+    except subprocess.TimeoutExpired:
+        print(f'ERROR: analyzer timed out after {analyzer_timeout:.0f}s; raise rotator_analyzer_timeout_seconds in config.json', file=sys.stderr)
+        return 3
     if analysis_proc.returncode != 0:
         print('ERROR: analyzer failed', file=sys.stderr)
         print(analysis_proc.stderr[-2000:], file=sys.stderr)
@@ -69,7 +76,11 @@ def main() -> int:
     bot_cmd = [sys.executable, str(BOT), '--json']
     if args.live:
         bot_cmd.append('--live')
-    bot_proc = run(bot_cmd)
+    try:
+        bot_proc = run(bot_cmd, timeout=bot_timeout)
+    except subprocess.TimeoutExpired:
+        print(f'ERROR: bot run timed out after {bot_timeout:.0f}s; raise rotator_bot_timeout_seconds in config.json', file=sys.stderr)
+        return 3
     if bot_proc.returncode != 0:
         print('ERROR: bot failed', file=sys.stderr)
         print(bot_proc.stderr[-2000:], file=sys.stderr)
@@ -91,7 +102,7 @@ def main() -> int:
         'top': result.get('top'),
         'proposed_order': result.get('proposed_order'),
     }
-    if result.get('decision') in {'ORDER_SENT', 'PREVIEW_ONLY', 'LIVE_BLOCKED_CONFIG_ACTIVE_TRADING_FALSE', 'LIVE_BLOCKED_ENV_TRADING_DISABLED', 'INSUFFICIENT_USDC', 'ORDER_TOO_SMALL'}:
+    if result.get('decision') in {'ORDER_SENT', 'PREVIEW_ONLY', 'DAILY_LOSS_LIMIT_REACHED', 'LIVE_BLOCKED_CONFIG_ACTIVE_TRADING_FALSE', 'LIVE_BLOCKED_ENV_TRADING_DISABLED', 'INSUFFICIENT_USDC', 'ORDER_TOO_SMALL'}:
         print(json.dumps(summary, indent=2, sort_keys=True))
     elif args.json:
         print(json.dumps(summary, indent=2, sort_keys=True))

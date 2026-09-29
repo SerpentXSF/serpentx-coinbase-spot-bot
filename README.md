@@ -65,10 +65,13 @@ Live trading requires **all** of these gates:
 2. `COINBASE_TRADING_ENABLED=1` in `.env`
 3. running the command with `--live`
 
-The default `config.example.json` ships with live trading disabled.
+The default `config.example.json` ships with live trading disabled. Every run prints a `Live gates:` line showing which gates are open, and a `*** LIVE TRADING ENABLED ***` banner goes to stderr when all three are.
 
 Additional protections include:
 
+- **daily loss limit** — once today's (UTC) realized loss reaches `daily_max_loss_pct` of `sizing_quote_balance_target` (default 2.5% of 100 USDC = 2.50 USDC), new entries stop with `DAILY_LOSS_LIMIT_REACHED` until the next UTC day. Exits keep running.
+- **run lock** — the rotator/bot and the exit monitor share `state/run.lock`, so overlapping cron jobs skip (`SKIPPED_RUN_LOCKED`) instead of trading on the same state twice. A lock older than `run_lock_stale_seconds` (default 900) from a crashed run is taken over automatically.
+- **actual fill tracking** — after a market order the bot reads Coinbase's fill (average price, size, fees) and uses it for the position entry price and realized P&L, falling back to an estimate only if the fill is not reported yet.
 - daily trade cap
 - max open positions
 - min/max trade sizing
@@ -174,6 +177,9 @@ Leave blank if unused. The bot treats optional provider failures as fail-neutral
 | `401 Unauthorized` on private calls | Check the key name is the full `organizations/.../apiKeys/...` string, the key is not revoked/IP-restricted, and your system clock is correct (the bot auto-corrects drift over 30 s). |
 | `Decision: NEEDS_CREDENTIALS_FOR_PREVIEW_OR_TRADE` | Normal without keys: order previews use a private Coinbase endpoint. |
 | `LIVE_BLOCKED_...` decisions | A live gate is still closed — see [Safety design](#safety-design). This is working as intended. |
+| `DAILY_LOSS_LIMIT_REACHED` | Today's realized loss hit `daily_max_loss_pct`. Entries resume at 00:00 UTC; open positions are still managed. The running total is in `state/state.json` → `daily_realized_pnl`. |
+| `SKIPPED_RUN_LOCKED` | Another bot/exit-monitor run was active. The next scheduled run proceeds normally. If a run crashed, the lock is cleared after `run_lock_stale_seconds`. |
+| `ERROR: analyzer timed out` / `bot run timed out` | Coinbase was slow. Raise `rotator_analyzer_timeout_seconds` / `rotator_bot_timeout_seconds` in `config.json`. |
 | One product shows `action: ERROR` | That product was delisted/renamed or its candles failed; the rest of the watchlist still runs. `rotate_and_run.py` refreshes the list. |
 
 ## Basic usage

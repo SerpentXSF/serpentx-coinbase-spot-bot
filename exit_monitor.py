@@ -142,16 +142,6 @@ def run(*, live: bool = False, json_status: bool = False) -> dict[str, Any]:
         trailing_reason = _trailing_exit_reason(cfg, pos, current, entry)
         if trailing_reason and not sell_reason:
             sell_reason = trailing_reason
-            enriched = {
-                **pos,
-                "current_price": _round_money(current),
-                "pnl_pct": pnl_pct,
-                "take_profit_price": _round_money(entry * (1 + float(cfg["take_profit_pct"]))),
-                "stop_loss_price": _round_money(entry * (1 - float(cfg["stop_loss_pct"]))),
-                "soft_invalidation_price": _round_money(entry * (1 - float(cfg["soft_invalidation_pct"]))),
-                "available_base_balance": balances.get(base, 0.0),
-                "exit_base_size": exit_base_size,
-            }
         enriched["exit_base_size"] = exit_base_size
 
         if sell_reason and exit_base_size > 0:
@@ -169,28 +159,32 @@ def run(*, live: bool = False, json_status: bool = False) -> dict[str, Any]:
             }
             result["preview"] = bot.preview_limit(product_id, "SELL", limit_price, base_size=exit_base_size, post_only=bool(cfg.get("maker_limit_post_only", True))) if use_limit else bot.preview_market(product_id, "SELL", base_size=exit_base_size)
             gate = bot.live_gates_open(cfg, live)
+            replacement: dict[str, Any] | None = pos
             if gate:
                 result["decision"] = gate
-                updated_positions.append(pos)
             else:
                 order = bot.place_limit(product_id, "SELL", limit_price, base_size=exit_base_size, post_only=bool(cfg.get("maker_limit_post_only", True))) if use_limit else bot.place_market(product_id, "SELL", base_size=exit_base_size)
                 result["order"] = order
+                scale_exit_reason = str(cfg.get("scale_exit_reason", "SCALE_TAKE_PROFIT"))
                 if order.get("success") is True:
+                    oid = bot.order_id_from_response(order)
                     if use_limit:
-                        oid = bot.order_id_from_response(order)
                         result["decision"] = "LIMIT_ORDER_PLACED"
                         pending_position = dict(pos)
-                        if sell_reason == str(cfg.get("scale_exit_reason", "SCALE_TAKE_PROFIT")):
+                        if sell_reason == scale_exit_reason:
                             pending_position["scale_exit_pending_order_id"] = oid
+                            replacement = pending_position
                         state.setdefault("pending_orders", []).append({"order_id": oid, "product_id": product_id, "side": "SELL", "reason": sell_reason, "base_size": exit_base_size, "limit_price": limit_price, "placed_at": result["ts"], "position": pending_position, "order_type": "LIMIT_POST_ONLY", "source": "exit_monitor"})
-                        updated_positions.append(pending_position if sell_reason == str(cfg.get("scale_exit_reason", "SCALE_TAKE_PROFIT")) else pos)
                     else:
-                        scale_exit_reason = str(cfg.get("scale_exit_reason", "SCALE_TAKE_PROFIT"))
+                        fill = bot.market_fill_details(oid)
+                        filled_size = bot.fnum(fill.get("filled_size")) or exit_base_size
+                        realized = bot.realized_pnl_quote(cfg, pos, filled_size, fill, current)
+                        bot.record_realized_pnl(state, realized, result["ts"])
+                        result["fill"] = fill
+                        result["realized_pnl_quote"] = realized
                         if sell_reason == scale_exit_reason:
                             result["decision"] = "PARTIAL_EXIT_SENT"
-                            updated = bot.apply_partial_exit_fill(pos, exit_base_size, result["ts"])
-                            if updated:
-                                updated_positions = [updated if p is pos else p for p in positions]
+                            replacement = bot.apply_partial_exit_fill(pos, filled_size, result["ts"])
                         else:
                             result["decision"] = "ORDER_SENT"
                             state["cooldown_until"] = (bot.utcnow() + timedelta(minutes=float(cfg["cooldown_minutes_after_trade"]))).isoformat()
@@ -198,16 +192,18 @@ def run(*, live: bool = False, json_status: bool = False) -> dict[str, Any]:
                                 _set_product_cooldown(state, product_id, float(cfg.get("per_product_cooldown_minutes_after_stop", 720)))
                             else:
                                 _set_product_cooldown(state, product_id, float(cfg.get("per_product_cooldown_minutes_after_trade", 180)))
-                            updated_positions = [p for p in positions if p is not pos]
+                            replacement = None
                         bot.append_jsonl(Path(cfg["trades_log_path"]), {
                             "ts": result["ts"],
                             "side": "SELL",
                             "reason": sell_reason,
                             "order": order,
                             "position": pos,
-                            "base_size": exit_base_size,
+                            "base_size": filled_size,
                             "source": "exit_monitor",
                             "order_type": "MARKET_IOC",
+                            "fill": fill,
+                            "realized_pnl_quote": realized,
                         })
                 else:
                     result["decision"] = "ORDER_FAILED"
@@ -220,8 +216,7 @@ def run(*, live: bool = False, json_status: bool = False) -> dict[str, Any]:
                         "source": "exit_monitor",
                         "failed": True,
                     })
-                    updated_positions.append(pos)
-            bot.persist_positions(state, updated_positions)
+            bot.persist_positions(state, bot.replace_position(positions, pos, replacement))
             break
 
         updated_positions.append(pos)
@@ -245,7 +240,15 @@ def main() -> int:
     ap.add_argument("--json", action="store_true", help="Print status even when no exit fires")
     args = ap.parse_args()
 
-    result = run(live=args.live, json_status=args.json)
+    cfg = bot.load_config(CONFIG)
+    try:
+        with bot.run_lock_for(cfg):
+            result = run(live=args.live, json_status=args.json)
+    except bot.RunLocked as exc:
+        # Another run is managing positions right now; the next tick will retry.
+        if args.json:
+            print(_event({"ts": bot.utcnow().isoformat(), "monitor": "exit_only", "decision": "SKIPPED_RUN_LOCKED", "reason": str(exc)}))
+        return 0
     # Quiet cron behavior: no output for ordinary holds/no positions. no_agent cron
     # sends nothing on empty stdout, but sends important exit/block/error events.
     if args.json or result.get("decision") not in {"HOLD_POSITIONS", "NO_POSITIONS"}:
