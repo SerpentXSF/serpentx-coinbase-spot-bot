@@ -1,3 +1,5 @@
-requests>=2.31.0
-PyJWT>=2.8.0
+# Tested in CI on Python 3.10-3.13. Upper bounds guard against breaking major
+# releases; cryptography is left uncapped so security fixes are never blocked.
+requests>=2.31.0,<3
+PyJWT>=2.8.0,<3
 cryptography>=42.0.0

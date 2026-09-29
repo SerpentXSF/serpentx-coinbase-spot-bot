@@ -16,118 +16,23 @@ Required env vars:
 import argparse
 import json
 import os
-import secrets
 import sys
-import time
 import uuid
-from email.utils import parsedate_to_datetime
 from pathlib import Path
 
-import jwt
-import requests
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import ec, ed25519
+# Reuse the bot's single implementation of .env loading, JWT signing, clock
+# drift correction, and request handling so the two never drift apart.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import coinbase_spot_bot as bot  # noqa: E402
 
-BASE_HOST = "api.coinbase.com"
-BASE_URL = f"https://{BASE_HOST}"
-
-
-def load_dotenv(path: str = ".env") -> None:
-    p = Path(path)
-    if not p.exists():
-        return
-    for raw in p.read_text().splitlines():
-        line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        key = key.strip()
-        value = value.strip()
-        if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
-            value = value[1:-1]
-        value = value.replace("\\n", "\n")
-        os.environ.setdefault(key, value)
-
-
-def require_env(name: str) -> str:
-    val = os.getenv(name)
-    if not val:
-        raise RuntimeError(f"Missing required env var: {name}")
-    return val
-
-
-def load_private_key(secret: str):
-    secret = secret.replace("\\n", "\n")
-    if secret.lstrip().startswith("-----BEGIN"):
-        return serialization.load_pem_private_key(secret.encode("utf-8"), password=None)
-    raise RuntimeError("Private key must be PEM text for this client.")
-
-
-def algorithm_for(private_key) -> str:
-    if isinstance(private_key, ed25519.Ed25519PrivateKey):
-        return "EdDSA"
-    if isinstance(private_key, ec.EllipticCurvePrivateKey):
-        return "ES256"
-    raise RuntimeError(f"Unsupported private key type: {type(private_key).__name__}")
-
-
-_COINBASE_TIME_OFFSET = {"value": 0.0, "checked_at": 0.0}
-
-
-def coinbase_epoch_now() -> int:
-    """Return Coinbase-aligned epoch seconds for short-lived JWT auth.
-
-    WSL/host clocks can drift after sleep or VM restarts. Coinbase JWTs are
-    short-lived, so a local clock that is materially behind the API server can
-    cause valid credentials to return 401 Unauthorized. Use Coinbase's public
-    Date header as a bounded, cached correction when skew is noticeable.
-    """
-    now = time.time()
-    if now - float(_COINBASE_TIME_OFFSET.get("checked_at") or 0) < 300:
-        return int(now + float(_COINBASE_TIME_OFFSET.get("value") or 0))
-    try:
-        resp = requests.get(BASE_URL + "/api/v3/brokerage/market/products/BTC-USDC", timeout=10)
-        server_date = resp.headers.get("Date")
-        if server_date:
-            offset = parsedate_to_datetime(server_date).timestamp() - now
-            _COINBASE_TIME_OFFSET["value"] = offset if abs(offset) > 30 else 0.0
-            _COINBASE_TIME_OFFSET["checked_at"] = now
-    except Exception:
-        _COINBASE_TIME_OFFSET["checked_at"] = now
-    return int(time.time() + float(_COINBASE_TIME_OFFSET.get("value") or 0))
-
-
-def build_jwt(method: str, path: str) -> str:
-    key_name = require_env("COINBASE_API_KEY_NAME")
-    private_key = load_private_key(require_env("COINBASE_API_PRIVATE_KEY"))
-    now = coinbase_epoch_now()
-    uri = f"{method.upper()} {BASE_HOST}{path}"
-    payload = {
-        "sub": key_name,
-        "iss": "cdp",
-        "nbf": now,
-        "exp": now + 120,
-        "uri": uri,
-    }
-    headers = {"kid": key_name, "nonce": secrets.token_hex()}
-    return jwt.encode(payload, private_key, algorithm=algorithm_for(private_key), headers=headers)
+BASE_HOST = bot.BASE_HOST
+BASE_URL = bot.BASE_URL
+load_dotenv = bot.load_dotenv
+build_jwt = bot.build_jwt
 
 
 def request(method: str, path: str, body: dict | None = None) -> dict:
-    method = method.upper()
-    token = build_jwt(method, path)
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json",
-    }
-    resp = requests.request(method, BASE_URL + path, headers=headers, json=body, timeout=30)
-    try:
-        data = resp.json()
-    except Exception:
-        data = {"raw": resp.text}
-    if resp.status_code >= 400:
-        raise RuntimeError(json.dumps({"status_code": resp.status_code, "response": data}, indent=2))
-    return data
+    return bot.private_request(method, path, body)
 
 
 def accounts(args):
@@ -178,7 +83,7 @@ def place_market_order(args):
 
 
 def main():
-    load_dotenv()
+    load_dotenv(bot.ROOT / ".env")
     parser = argparse.ArgumentParser(description="Coinbase Advanced Trade REST helper")
     sub = parser.add_subparsers(dest="cmd", required=True)
 

@@ -62,6 +62,27 @@ def load_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text())
 
 
+def resolve_runtime_paths(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Anchor relative ``*_path`` / ``env_file`` config entries to the bot folder.
+
+    Without this, state, logs, and caches land in whatever directory the
+    scheduler happens to start in (for example ``/`` under systemd or Task
+    Scheduler), which silently splits bot state across folders.
+    """
+    out = dict(cfg)
+    for key, value in cfg.items():
+        if (key.endswith("_path") or key == "env_file") and isinstance(value, str) and value and not Path(value).is_absolute():
+            out[key] = str(ROOT / value)
+    return out
+
+
+def load_config(path: str | Path) -> dict[str, Any]:
+    p = Path(path)
+    if not p.exists():
+        raise RuntimeError(f"Config not found: {p}. Create it with: cp config.example.json config.json")
+    return resolve_runtime_paths(load_json(p))
+
+
 def save_json(path: Path, data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -161,10 +182,20 @@ def load_dotenv(path: str | Path) -> None:
         os.environ.setdefault(key, value)
 
 
+# Markers used by .env.example placeholders. A copied-but-unedited template must
+# behave like "no credentials" instead of crashing on an invalid PEM.
+_PLACEHOLDER_MARKERS = ("YOUR_ORG_ID", "YOUR_KEY_ID", "PASTE_YOUR", "<YOUR_", "<OPTIONAL_")
+
+
+def real_env(name: str) -> bool:
+    val = os.getenv(name) or ""
+    return bool(val.strip()) and not any(m in val for m in _PLACEHOLDER_MARKERS)
+
+
 def env_present() -> dict[str, bool]:
     return {
-        "COINBASE_API_KEY_NAME": bool(os.getenv("COINBASE_API_KEY_NAME")),
-        "COINBASE_API_PRIVATE_KEY": bool(os.getenv("COINBASE_API_PRIVATE_KEY")),
+        "COINBASE_API_KEY_NAME": real_env("COINBASE_API_KEY_NAME"),
+        "COINBASE_API_PRIVATE_KEY": real_env("COINBASE_API_PRIVATE_KEY"),
         "COINBASE_TRADING_ENABLED": os.getenv("COINBASE_TRADING_ENABLED") == "1",
         "HELIUS_API_KEY": bool(os.getenv("HELIUS_API_KEY")),
         "HELIUS_RPC_URL": bool(os.getenv("HELIUS_RPC_URL") or os.getenv("HELIUS_GATEKEEPER_RPC_URL")),
@@ -1081,6 +1112,21 @@ def score_product(cfg: dict[str, Any], product_id: str) -> Signal:
     return sig
 
 
+def safe_score_product(cfg: dict[str, Any], product_id: str) -> Signal:
+    """Score one product without letting a single bad symbol abort the run.
+
+    A delisted/renamed product or a transient candle error for one symbol should
+    not block exit management or entries for the rest of the watchlist.
+    """
+    try:
+        return score_product(cfg, product_id)
+    except Exception as exc:
+        s = Signal(product_id, 0.0, 0, "ERROR", [f"scoring failed: {str(exc)[:160]}"], 50.0, 0.0, 0.0)
+        s.risk_block = True
+        s.final_score = -99
+        return s
+
+
 def get_accounts() -> dict[str, Any]:
     # Request a larger page and keep query params out of the JWT URI. Coinbase
     # rejects tokens signed with the query string included in the uri claim.
@@ -1306,12 +1352,16 @@ def reconcile_pending_orders(cfg: dict[str, Any], state: dict[str, Any], balance
                         "entry_candle_low": fnum(row.get("entry_candle_low")) or avg_price,
                         "entry_order_id": row["order_id"],
                         "entry_order_type": "LIMIT_POST_ONLY",
+                        "entry_fees": fnum(detail.get("total_fees")),
                     })
                 state["cooldown_until"] = (utcnow() + timedelta(minutes=float(cfg["cooldown_minutes_after_trade"]))).isoformat()
                 append_jsonl(Path(cfg["trades_log_path"]), {"ts": event["ts"], "side": "BUY", "order": {"success": True, "success_response": {"order_id": row["order_id"], "product_id": product_id, "side": "BUY"}}, "order_detail": detail, "signal": row.get("signal", {}), "quote_size": row.get("quote_size"), "source": "maker_limit_reconcile"})
                 event["decision"] = "PENDING_BUY_FILLED_POSITION_OPENED"
             elif side == "SELL":
                 reason = row.get("reason") or "LIMIT_EXIT_FILLED"
+                realized = realized_pnl_quote(cfg, row.get("position") or {}, filled_size, {"average_filled_price": avg_price, "total_fees": fnum(detail.get("total_fees"))}, avg_price)
+                record_realized_pnl(state, realized, event["ts"])
+                event["realized_pnl_quote"] = realized
                 scale_exit_reason = str(cfg.get("scale_exit_reason", "SCALE_TAKE_PROFIT"))
                 if reason == scale_exit_reason:
                     updated_positions = []
@@ -1323,7 +1373,7 @@ def reconcile_pending_orders(cfg: dict[str, Any], state: dict[str, Any], balance
                         else:
                             updated_positions.append(p)
                     positions = updated_positions
-                    append_jsonl(Path(cfg["trades_log_path"]), {"ts": event["ts"], "side": "SELL", "reason": reason, "order": {"success": True, "success_response": {"order_id": row["order_id"], "product_id": product_id, "side": "SELL"}}, "order_detail": detail, "position": row.get("position", {}), "base_size": filled_size, "source": "maker_limit_reconcile"})
+                    append_jsonl(Path(cfg["trades_log_path"]), {"ts": event["ts"], "side": "SELL", "reason": reason, "order": {"success": True, "success_response": {"order_id": row["order_id"], "product_id": product_id, "side": "SELL"}}, "order_detail": detail, "position": row.get("position", {}), "base_size": filled_size, "realized_pnl_quote": realized, "source": "maker_limit_reconcile"})
                     event["decision"] = "PENDING_PARTIAL_SELL_FILLED_POSITION_REDUCED"
                 else:
                     positions = [p for p in positions if p.get("product_id") != product_id]
@@ -1331,7 +1381,7 @@ def reconcile_pending_orders(cfg: dict[str, Any], state: dict[str, Any], balance
                         set_product_cooldown(state, product_id, float(cfg.get("per_product_cooldown_minutes_after_stop", 720)))
                     else:
                         set_product_cooldown(state, product_id, float(cfg.get("per_product_cooldown_minutes_after_trade", 180)))
-                    append_jsonl(Path(cfg["trades_log_path"]), {"ts": event["ts"], "side": "SELL", "reason": reason, "order": {"success": True, "success_response": {"order_id": row["order_id"], "product_id": product_id, "side": "SELL"}}, "order_detail": detail, "position": row.get("position", {}), "source": "maker_limit_reconcile"})
+                    append_jsonl(Path(cfg["trades_log_path"]), {"ts": event["ts"], "side": "SELL", "reason": reason, "order": {"success": True, "success_response": {"order_id": row["order_id"], "product_id": product_id, "side": "SELL"}}, "order_detail": detail, "position": row.get("position", {}), "realized_pnl_quote": realized, "source": "maker_limit_reconcile"})
                     event["decision"] = "PENDING_SELL_FILLED_POSITION_CLOSED"
             events.append(event)
             continue
@@ -1592,10 +1642,166 @@ def apply_partial_exit_fill(pos: dict[str, Any], filled_size: float, ts: str | N
     updated["base_size_est"] = remaining_size
     if fnum(updated.get("quote_size")) > 0:
         updated["quote_size"] = fnum(updated.get("quote_size")) * ratio
+    if fnum(updated.get("entry_fees")) > 0:
+        updated["entry_fees"] = fnum(updated.get("entry_fees")) * ratio
     updated["scale_exit_done"] = True
     updated["scale_exit_filled_at"] = ts or utcnow().isoformat()
     updated.pop("scale_exit_pending_order_id", None)
     return updated
+
+
+def replace_position(positions: list[dict[str, Any]], target: dict[str, Any], replacement: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """Swap ``target`` for ``replacement`` (or drop it when None), keeping every other position.
+
+    Exit loops stop at the first position that fires, so the new list must be
+    built from the full position list; otherwise positions after the exiting
+    one silently fall out of state and lose their stop-loss management.
+    """
+    out: list[dict[str, Any]] = []
+    for p in positions:
+        if p is target:
+            if replacement:
+                out.append(replacement)
+        else:
+            out.append(p)
+    return out
+
+
+def market_fill_details(order_id: str, attempts: int = 3, delay_seconds: float = 1.0) -> dict[str, Any]:
+    """Best-effort actual fill for a just-placed market IOC order.
+
+    Returns {} when Coinbase has not reported a fill yet or the lookup fails;
+    callers then fall back to the signal/ticker price estimate.
+    """
+    if not order_id:
+        return {}
+    for attempt in range(max(1, attempts)):
+        try:
+            detail = fetch_order_detail(order_id)
+        except Exception:
+            detail = {}
+        status = str(detail.get("status") or "").upper()
+        size = fnum(detail.get("filled_size"))
+        price = fnum(detail.get("average_filled_price"))
+        # IOC orders report CANCELLED for any unfilled remainder, so accept that too.
+        if size > 0 and price > 0 and status in {"FILLED", "CANCELLED", "EXPIRED"}:
+            return {
+                "order_id": order_id,
+                "status": status,
+                "filled_size": size,
+                "average_filled_price": price,
+                "filled_value": fnum(detail.get("filled_value")) or size * price,
+                "total_fees": fnum(detail.get("total_fees")),
+            }
+        if attempt < attempts - 1:
+            time.sleep(delay_seconds)
+    return {}
+
+
+def _taker_fee_pct(cfg: dict[str, Any]) -> float:
+    fees = cfg.get("fee_tracking") if isinstance(cfg.get("fee_tracking"), dict) else {}
+    return fnum(fees.get("observed_taker_fee_pct_per_side"), fnum(fees.get("estimated_roundtrip_fee_pct")) / 2)
+
+
+def realized_pnl_quote(cfg: dict[str, Any], pos: dict[str, Any], filled_size: float, fill: dict[str, Any], fallback_price: float) -> float:
+    """Net quote P&L for selling ``filled_size`` of ``pos``.
+
+    Uses the actual fill and fees when known; otherwise estimates both sides at
+    the configured taker fee so the daily loss guard errs on the cautious side.
+    """
+    entry = fnum(pos.get("entry_price"))
+    exit_price = fnum(fill.get("average_filled_price")) or fallback_price
+    if entry <= 0 or exit_price <= 0 or filled_size <= 0:
+        return 0.0
+    fee_pct = _taker_fee_pct(cfg)
+    exit_fees = fnum(fill.get("total_fees")) if fill.get("average_filled_price") else exit_price * filled_size * fee_pct
+    held = max(fnum(pos.get("base_size_est")), filled_size)
+    entry_fees = fnum(pos.get("entry_fees")) * (filled_size / held) if pos.get("entry_fees") is not None else entry * filled_size * fee_pct
+    return round((exit_price - entry) * filled_size - exit_fees - entry_fees, 8)
+
+
+def record_realized_pnl(state: dict[str, Any], pnl_quote: float, ts: str | None = None) -> dict[str, Any]:
+    """Add a closed/partial exit to today's (UTC) realized P&L ledger."""
+    day = (ts or utcnow().isoformat())[:10]
+    ledger = state.get("daily_realized_pnl")
+    if not isinstance(ledger, dict) or ledger.get("date") != day:
+        ledger = {"date": day, "realized_quote": 0.0, "exits": 0}
+    ledger["realized_quote"] = round(fnum(ledger.get("realized_quote")) + fnum(pnl_quote), 8)
+    ledger["exits"] = int(ledger.get("exits") or 0) + 1
+    state["daily_realized_pnl"] = ledger
+    return ledger
+
+
+def daily_loss_limit_status(cfg: dict[str, Any], state: dict[str, Any], quote_bal: float, now: datetime | None = None) -> dict[str, Any] | None:
+    """Return details when today's realized loss has hit ``daily_max_loss_pct``.
+
+    The limit is a fraction of the sizing bankroll (``sizing_quote_balance_target``
+    when set, else the quote balance). It blocks new entries only; exits for
+    open positions always keep running.
+    """
+    pct = fnum(cfg.get("daily_max_loss_pct"))
+    if pct <= 0:
+        return None
+    ledger = state.get("daily_realized_pnl")
+    today = (now or utcnow()).date().isoformat()
+    if not isinstance(ledger, dict) or ledger.get("date") != today:
+        return None
+    bankroll = fnum(cfg.get("sizing_quote_balance_target")) or quote_bal
+    limit = bankroll * pct
+    realized = fnum(ledger.get("realized_quote"))
+    if limit > 0 and realized <= -limit:
+        return {"date": today, "realized_quote": realized, "limit_quote": -round(limit, 8), "daily_max_loss_pct": pct}
+    return None
+
+
+class RunLocked(RuntimeError):
+    pass
+
+
+class RunLock:
+    """Cross-platform exclusive lock so the rotator/bot and exit monitor never
+    trade on the same state file at the same time. A lock older than
+    ``stale_seconds`` (a crashed run) is taken over."""
+
+    def __init__(self, path: str | Path, stale_seconds: float = 900):
+        self.path = Path(path)
+        self.stale_seconds = stale_seconds
+        self.acquired = False
+
+    def __enter__(self) -> "RunLock":
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        for _ in range(2):
+            try:
+                fd = os.open(str(self.path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError:
+                try:
+                    age = time.time() - self.path.stat().st_mtime
+                except FileNotFoundError:
+                    continue
+                if age > self.stale_seconds:
+                    try:
+                        self.path.unlink()
+                    except FileNotFoundError:
+                        pass
+                    continue
+                raise RunLocked(f"another bot run holds {self.path} (age {age:.0f}s)")
+            with os.fdopen(fd, "w") as f:
+                f.write(json.dumps({"pid": os.getpid(), "started_at": utcnow().isoformat(), "argv": sys.argv[:3]}))
+            self.acquired = True
+            return self
+        raise RunLocked(f"could not acquire {self.path}")
+
+    def __exit__(self, *exc: Any) -> None:
+        if self.acquired:
+            try:
+                self.path.unlink()
+            except FileNotFoundError:
+                pass
+            self.acquired = False
+
+
+def run_lock_for(cfg: dict[str, Any]) -> RunLock:
+    return RunLock(Path(cfg["state_path"]).parent / "run.lock", float(cfg.get("run_lock_stale_seconds", 900)))
 
 
 def choose_entry_signal(cfg: dict[str, Any], signals: list[Signal], positions: list[dict[str, Any]], state: dict[str, Any] | None = None) -> Signal | None:
@@ -1626,8 +1832,10 @@ def run(cfg: dict[str, Any], *, status: bool=False, live: bool=False) -> dict[st
     load_dotenv(str(ROOT / "secrets" / "rpc_providers.env"))
     load_dotenv(cfg.get("env_file", ROOT / ".env"))
     context_cache = _load_context_cache(cfg)
-    signals = [score_product(cfg, p) for p in cfg["allowed_products"]]
-    signals = [apply_context_scores(cfg, s, context_cache) for s in signals]
+    signals = [safe_score_product(cfg, p) for p in cfg["allowed_products"]]
+    if not signals:
+        raise RuntimeError("config allowed_products is empty; run rotate_and_run.py or add products to config.json")
+    signals = [s if s.action == "ERROR" else apply_context_scores(cfg, s, context_cache) for s in signals]
     _save_context_cache(cfg, context_cache)
     signals.sort(key=lambda s: (s.final_score or s.score, s.score, s.change_24h, s.quote_volume), reverse=True)
     top = signals[0]
@@ -1677,6 +1885,8 @@ def run(cfg: dict[str, Any], *, status: bool=False, live: bool=False) -> dict[st
     pending_orders = normalize_pending_orders(state)
     max_positions = int(cfg.get("max_open_positions", 1))
     result["daily_trades_used"] = daily_trades
+    result["daily_realized_pnl"] = state.get("daily_realized_pnl")
+    result["live_gates"] = {"--live": bool(live), "config_active_trading": bool(cfg.get("active_trading")), "env_COINBASE_TRADING_ENABLED": os.getenv("COINBASE_TRADING_ENABLED") == "1"}
     result["open_positions"] = positions
     result["pending_orders"] = pending_orders
 
@@ -1741,28 +1951,32 @@ def run(cfg: dict[str, Any], *, status: bool=False, live: bool=False) -> dict[st
                 result["proposed_order"] = {"product_id": pos_product, "side": "SELL", "base_size": exit_base_size, "reason": sell_reason, "order_type": "LIMIT_POST_ONLY" if use_limit else "MARKET_IOC", "limit_price": limit_price}
                 result["preview"] = preview_limit(pos_product, "SELL", limit_price, base_size=exit_base_size, post_only=bool(cfg.get("maker_limit_post_only", True))) if use_limit else preview_market(pos_product, "SELL", base_size=exit_base_size)
                 gate = live_gates_open(cfg, live)
+                replacement: dict[str, Any] | None = pos
                 if gate:
                     result["decision"] = gate
-                    updated_positions.append(pos)
                 else:
                     order = place_limit(pos_product, "SELL", limit_price, base_size=exit_base_size, post_only=bool(cfg.get("maker_limit_post_only", True))) if use_limit else place_market(pos_product, "SELL", base_size=exit_base_size)
                     result["order"] = order
+                    scale_exit_reason = str(cfg.get("scale_exit_reason", "SCALE_TAKE_PROFIT"))
                     if order.get("success") is True:
                         oid = order_id_from_response(order)
                         if use_limit:
                             result["decision"] = "LIMIT_ORDER_PLACED"
                             pending_position = dict(pos)
-                            if sell_reason == str(cfg.get("scale_exit_reason", "SCALE_TAKE_PROFIT")):
+                            if sell_reason == scale_exit_reason:
                                 pending_position["scale_exit_pending_order_id"] = oid
+                                replacement = pending_position
                             state.setdefault("pending_orders", []).append({"order_id": oid, "product_id": pos_product, "side": "SELL", "reason": sell_reason, "base_size": exit_base_size, "limit_price": limit_price, "placed_at": result["ts"], "position": pending_position, "order_type": "LIMIT_POST_ONLY"})
-                            updated_positions.append(pending_position if sell_reason == str(cfg.get("scale_exit_reason", "SCALE_TAKE_PROFIT")) else pos)
                         else:
-                            scale_exit_reason = str(cfg.get("scale_exit_reason", "SCALE_TAKE_PROFIT"))
+                            fill = market_fill_details(oid)
+                            filled_size = fnum(fill.get("filled_size")) or exit_base_size
+                            realized = realized_pnl_quote(cfg, pos, filled_size, fill, current)
+                            record_realized_pnl(state, realized, result["ts"])
+                            result["fill"] = fill
+                            result["realized_pnl_quote"] = realized
                             if sell_reason == scale_exit_reason:
                                 result["decision"] = "PARTIAL_EXIT_SENT"
-                                updated = apply_partial_exit_fill(pos, exit_base_size, result["ts"])
-                                if updated:
-                                    updated_positions = [updated if p is pos else p for p in positions]
+                                replacement = apply_partial_exit_fill(pos, filled_size, result["ts"])
                             else:
                                 result["decision"] = "ORDER_SENT"
                                 state["cooldown_until"] = (utcnow() + timedelta(minutes=float(cfg["cooldown_minutes_after_trade"]))).isoformat()
@@ -1770,13 +1984,12 @@ def run(cfg: dict[str, Any], *, status: bool=False, live: bool=False) -> dict[st
                                     set_product_cooldown(state, pos_product, float(cfg.get("per_product_cooldown_minutes_after_stop", 720)))
                                 else:
                                     set_product_cooldown(state, pos_product, float(cfg.get("per_product_cooldown_minutes_after_trade", 180)))
-                                updated_positions = [p for p in positions if p is not pos]
-                            append_jsonl(Path(cfg["trades_log_path"]), {"ts": result["ts"], "side": "SELL", "reason": sell_reason, "order": order, "position": pos, "base_size": exit_base_size, "order_type": "MARKET_IOC"})
+                                replacement = None
+                            append_jsonl(Path(cfg["trades_log_path"]), {"ts": result["ts"], "side": "SELL", "reason": sell_reason, "order": order, "position": pos, "base_size": filled_size, "order_type": "MARKET_IOC", "fill": fill, "realized_pnl_quote": realized})
                     else:
                         result["decision"] = "ORDER_FAILED"
-                        updated_positions.append(pos)
                         append_jsonl(Path(cfg["trades_log_path"]), {"ts": result["ts"], "side": "SELL", "reason": sell_reason, "order": order, "position": pos, "failed": True})
-                persist_positions(state, updated_positions)
+                persist_positions(state, replace_position(positions, pos, replacement))
                 break
             updated_positions.append(pos)
         else:
@@ -1797,6 +2010,9 @@ def run(cfg: dict[str, Any], *, status: bool=False, live: bool=False) -> dict[st
             result["cooldown_until"] = cooldown_until
         elif daily_trades >= int(cfg.get("daily_max_trades", 2)):
             result["decision"] = "DAILY_TRADE_LIMIT_REACHED"
+        elif daily_loss_limit_status(cfg, state, quote_bal):
+            result["decision"] = "DAILY_LOSS_LIMIT_REACHED"
+            result["daily_loss_limit"] = daily_loss_limit_status(cfg, state, quote_bal)
         elif len(positions) >= max_positions:
             result["decision"] = "HOLD_POSITIONS"
         elif entry_signal is None:
@@ -1829,18 +2045,26 @@ def run(cfg: dict[str, Any], *, status: bool=False, live: bool=False) -> dict[st
                         else:
                             result["decision"] = "ORDER_SENT"
                             state["cooldown_until"] = (utcnow() + timedelta(minutes=float(cfg["cooldown_minutes_after_trade"]))).isoformat()
+                            oid = order_id_from_response(order)
+                            fill = market_fill_details(oid)
+                            result["fill"] = fill
+                            entry_price = fnum(fill.get("average_filled_price")) or entry_signal.price
                             positions.append({
                                 "product_id": entry_signal.product_id,
-                                "entry_price": entry_signal.price,
-                                "quote_size": quote_size,
-                                "base_size_est": quote_size / entry_signal.price if entry_signal.price > 0 else 0.0,
+                                "entry_price": entry_price,
+                                "signal_price": entry_signal.price,
+                                "quote_size": fnum(fill.get("filled_value")) or quote_size,
+                                "base_size_est": fnum(fill.get("filled_size")) or (quote_size / entry_signal.price if entry_signal.price > 0 else 0.0),
+                                "entry_fees": fnum(fill.get("total_fees")) if fill else None,
+                                "entry_order_id": oid,
+                                "entry_fill_source": "coinbase_order_detail" if fill else "signal_price_estimate",
                                 "opened_at": result["ts"],
-                                "high_water_price": entry_signal.price,
+                                "high_water_price": entry_price,
                                 "high_water_pnl_pct": 0.0,
                                 "entry_candle_low": min([fnum(c.get("low")) for c in fetch_candles(entry_signal.product_id, cfg.get("bar_exec", "FIFTEEN_MINUTE"), 4)[-4:] if fnum(c.get("low")) > 0] or [entry_signal.price]),
                             })
                             persist_positions(state, positions)
-                            append_jsonl(Path(cfg["trades_log_path"]), {"ts": result["ts"], "side": "BUY", "order": order, "signal": entry_signal.__dict__, "quote_size": quote_size, "order_type": "MARKET_IOC"})
+                            append_jsonl(Path(cfg["trades_log_path"]), {"ts": result["ts"], "side": "BUY", "order": order, "signal": entry_signal.__dict__, "quote_size": quote_size, "order_type": "MARKET_IOC", "fill": fill})
                     else:
                         result["decision"] = "ORDER_FAILED"
                         append_jsonl(Path(cfg["trades_log_path"]), {"ts": result["ts"], "side": "BUY", "order": order, "signal": entry_signal.__dict__, "quote_size": quote_size, "failed": True})
@@ -1868,6 +2092,12 @@ def summarize(result: dict[str, Any]) -> str:
         parts.append("Balances checked: " + ", ".join(f"{k}={v:.6g}" for k, v in sorted(result["balances"].items())))
     if "auth_status" in result:
         parts.append(f"Auth: {result['auth_status']}")
+    gates = result.get("live_gates") or {}
+    if gates:
+        parts.append("Live gates: " + ", ".join(f"{k}={'open' if v else 'closed'}" for k, v in gates.items()))
+    pnl = result.get("daily_realized_pnl")
+    if isinstance(pnl, dict):
+        parts.append(f"Realized P&L {pnl.get('date')}: {fnum(pnl.get('realized_quote')):+.4f} over {pnl.get('exits', 0)} exit(s)")
     if "proposed_order" in result:
         parts.append("Proposed: " + json.dumps(result["proposed_order"], sort_keys=True))
     return "\n".join(parts)
@@ -1880,8 +2110,18 @@ def main() -> None:
     ap.add_argument("--live", action="store_true", help="Attempt live order if all gates allow it")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
-    cfg = load_json(Path(args.config))
-    result = run(cfg, status=args.status, live=args.live)
+    cfg = load_config(args.config)
+    if args.live and not args.status and cfg.get("active_trading"):
+        load_dotenv(cfg.get("env_file", ROOT / ".env"))
+        if os.getenv("COINBASE_TRADING_ENABLED") == "1":
+            print("*** LIVE TRADING ENABLED: all three gates are open; real orders may be placed ***", file=sys.stderr)
+    try:
+        with run_lock_for(cfg):
+            result = run(cfg, status=args.status, live=args.live)
+    except RunLocked as exc:
+        skipped = {"ts": utcnow().isoformat(), "decision": "SKIPPED_RUN_LOCKED", "reason": str(exc)}
+        print(json.dumps(skipped, indent=2, sort_keys=True) if args.json else f"Skipped: {exc}")
+        return
     print(json.dumps(result, indent=2, sort_keys=True) if args.json else summarize(result))
 
 

@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+- Fixed `rotate_and_run.py` / `analyze_usdc_pairs.py` and `candidate_forward_backtest.py` crashing on startup with `NameError: name 'os' is not defined`.
+- Fixed the README quick start failing with `Coinbase private key must be PEM text` when `.env` was copied from the template but not yet filled in; placeholder credentials now count as "no credentials" and the template ships blank.
+- Fixed the dashboard reading `state.json` / `trades.jsonl` from the repo root instead of the `state/` and `logs/` paths the bot writes, so positions, cooldowns, and trades now appear.
+- Dashboard now binds to `127.0.0.1:8787` by default (was `0.0.0.0:2048`), matching the docs and keeping balances off the LAN.
+- Relative `*_path` config entries now resolve against the bot folder, so running from another directory (systemd, Task Scheduler) no longer splits state across folders.
+- One delisted or failing product no longer aborts the whole run; it is marked `ERROR` and skipped.
+- `candidate_forward_backtest.py` creates `analysis/` if missing; clear error when `config.json` is missing.
+- Added offline smoke tests for every documented command and a GitHub Actions CI workflow (Python 3.10-3.13).
+- Rewrote README install/setup into a single verified quick start with an API key walkthrough and troubleshooting table.
+- Fixed exits silently deleting other open positions from state: when the first position fired an exit that was not a full market close (preview mode, failed order, limit order, partial exit), every position after it was dropped and lost stop-loss management. Affects both the bot and the exit monitor.
+- Market orders now record Coinbase's actual fill (average price, size, fees) for entry price and realized P&L instead of the signal price.
+- `daily_max_loss_pct` is now enforced: new entries stop for the rest of the UTC day once realized losses reach the limit; exits keep running.
+- Added a shared run lock so the rotator/bot and exit monitor never trade on the same state concurrently.
+- Rotator timeouts are configurable (`rotator_analyzer_timeout_seconds`, `rotator_bot_timeout_seconds`) and fail with a clear message.
+- Runs print which live gates are open, with a stderr banner when all three are.
+- `coinbase_client.py` now reuses the bot's auth/request code instead of a divergent copy.
+- Pinned dependency major versions; default watchlist switched to liquid pairs (BTC, ETH, SOL, LINK, DOGE).
+
 ## v0.5.0-beta
 
 - Synced the public Spot bot with the latest live-safe strategy code, including Coinbase JWT timestamp correction for WSL/host clock drift.
