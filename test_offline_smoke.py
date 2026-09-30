@@ -28,6 +28,7 @@ SCRIPTS = [
     "trade_analytics_dashboard.py",
     "candidate_forward_backtest.py",
     "reconcile_orders.py",
+    "strategy_backtest.py",
 ]
 
 # Injected into subprocesses via sitecustomize so child scripts also use the fake API.
@@ -191,6 +192,22 @@ class OfflineSmokeTests(unittest.TestCase):
         proc = self.run_script("coinbase_client.py", "accounts")
         self.assertEqual(proc.returncode, 1)
         self.assertIn("Missing required env var: COINBASE_API_KEY_NAME", proc.stderr)
+
+    def test_strategy_backtest_cli(self) -> None:
+        proc = self.run_script("strategy_backtest.py", "--days", "1", "--products", "AAA-USDC,BBB-USDC", "--json")
+        self.assertOk(proc)
+        report = json.loads(proc.stdout)
+        self.assertEqual(report["products"], ["AAA-USDC", "BBB-USDC"])
+        self.assertIn("win_rate", report)
+        self.assertTrue((self.root / "analysis" / "strategy_backtest.json").exists())
+        self.assertTrue(any((self.root / "analysis" / "backtest_cache").iterdir()))
+        # Second run is served from the on-disk candle cache.
+        self.assertOk(self.run_script("strategy_backtest.py", "--days", "1", "--products", "AAA-USDC,BBB-USDC"))
+
+    def test_config_check_cli(self) -> None:
+        proc = self.run_script("config_check.py", "config.json")
+        self.assertOk(proc)
+        self.assertIn("looks valid", proc.stdout)
 
     def test_rotator_preview(self) -> None:
         proc = self.run_script("rotate_and_run.py", "--json")
