@@ -1,0 +1,192 @@
+#!/usr/bin/env python3
+"""Exit management shared by coinbase_spot_bot.run() and exit_monitor.run().
+
+Both entry points used to carry their own copy of this loop; the copies drifted
+and a state-loss bug had to be fixed twice. There is now exactly one.
+
+Coinbase access (prices, previews, orders, fills) and state helpers are reached
+through ``api`` -- the coinbase_spot_bot module object the caller already
+has -- rather than a top-level import. When the bot runs as ``__main__`` a
+plain ``import coinbase_spot_bot`` here would load a second copy of the bot;
+passing the module keeps one set of globals and lets tests patch it in one
+place.
+"""
+from __future__ import annotations
+
+from datetime import timedelta
+from pathlib import Path
+from types import ModuleType
+from typing import Any
+
+STOP_LIKE_REASONS = {"STOP_LOSS", "SOFT_INVALIDATION", "TRAILING_STOP", "BREAKEVEN_LOCK"}
+
+
+def exit_reason(api: ModuleType, cfg: dict[str, Any], pos: dict[str, Any], current: float, entry: float, base_size: float) -> tuple[str | None, float, bool]:
+    """Decide whether ``pos`` should exit now.
+
+    Returns (reason, base size to sell, structural) -- ``structural`` is True
+    when the reason came from structural_exit_reason, so the caller can attach
+    a fresh position signal for context.
+    """
+    pnl_pct = ((current - entry) / entry) if entry > 0 and current > 0 else 0.0
+    sell_reason = None
+    exit_base_size = base_size
+    structural = False
+    scale_reason, scale_size = api.scale_exit_plan(cfg, pos, current, entry, base_size)
+    if scale_reason:
+        sell_reason = scale_reason
+        exit_base_size = scale_size
+    elif pnl_pct >= float(cfg["take_profit_pct"]):
+        sell_reason = "TAKE_PROFIT"
+    elif pnl_pct <= -float(cfg["stop_loss_pct"]):
+        sell_reason = "STOP_LOSS"
+    else:
+        structural_reason = api.structural_exit_reason(cfg, pos, current, entry)
+        if structural_reason:
+            sell_reason = structural_reason
+            structural = True
+    trailing_reason = api.trailing_exit_reason(cfg, pos, current, entry)
+    if trailing_reason and not sell_reason:
+        sell_reason = trailing_reason
+    return sell_reason, exit_base_size, structural
+
+
+def manage_exits(
+    api: ModuleType,
+    cfg: dict[str, Any],
+    state: dict[str, Any],
+    positions: list[dict[str, Any]],
+    balances: dict[str, float],
+    result: dict[str, Any],
+    *,
+    live: bool,
+    context_cache: dict[str, Any] | None = None,
+    source: str | None = None,
+) -> bool:
+    """Check every bot-managed position and act on the first one that should exit.
+
+    At most one exit order is sent per call. Updates ``result`` (decision,
+    proposed_order, preview, order, fill, realized P&L, checked_positions) and
+    ``state`` (positions, pending orders, cooldowns, daily P&L ledger), and
+    appends SELL rows to the trades log. Returns True when an exit fired
+    (order sent, placed, failed, or blocked by a live gate), False when every
+    position is held -- in which case positions are persisted unchanged.
+    """
+    fnum = api.fnum
+    ts = result["ts"]
+    trades_log = Path(cfg["trades_log_path"])
+    post_only = bool(cfg.get("maker_limit_post_only", True))
+    scale_exit_reason = str(cfg.get("scale_exit_reason", "SCALE_TAKE_PROFIT"))
+    owns_cache = context_cache is None  # the exit monitor has no cache loaded; the bot passes its own
+    loaded_cache = context_cache
+    held: list[dict[str, Any]] = []
+
+    for pos in positions:
+        product_id = str(pos.get("product_id"))
+        base, _, _ = product_id.partition("-")
+        entry = fnum(pos.get("entry_price"))
+        current = fnum(api.product_info(product_id).get("price")) if product_id else 0.0
+        base_size = min(fnum(pos.get("base_size_est")), balances.get(base, 0.0))
+        pnl_pct = ((current - entry) / entry) if entry > 0 and current > 0 else 0.0
+
+        sell_reason, exit_base_size, structural = exit_reason(api, cfg, pos, current, entry, base_size)
+        if structural:
+            try:
+                if loaded_cache is None:
+                    loaded_cache = api._load_context_cache(cfg)  # noqa: SLF001
+                pos_signal = api.apply_context_scores(cfg, api.score_product(cfg, product_id), loaded_cache)
+                if owns_cache:
+                    api._save_context_cache(cfg, loaded_cache)  # noqa: SLF001
+                result["position_signal"] = pos_signal.__dict__
+            except Exception as exc:  # a context lookup must never block an exit
+                result["position_signal_error"] = str(exc)[:300]
+
+        enriched = {
+            **pos,
+            "current_price": round(current, 8),
+            "pnl_pct": pnl_pct,
+            "take_profit_price": round(entry * (1 + float(cfg["take_profit_pct"])), 8),
+            "stop_loss_price": round(entry * (1 - float(cfg["stop_loss_pct"])), 8),
+            "soft_invalidation_price": round(entry * (1 - float(cfg["soft_invalidation_pct"])), 8),
+            "available_base_balance": balances.get(base, 0.0),
+            "exit_base_size": exit_base_size,
+        }
+
+        if not (sell_reason and exit_base_size > 0):
+            held.append(pos)
+            result.setdefault("checked_positions", []).append(enriched)
+            continue
+
+        result["open_position"] = enriched
+        use_limit = api.should_use_maker_limit(cfg, "SELL", sell_reason)
+        limit_price = api.maker_limit_price(cfg, product_id, "SELL", current) if use_limit else None
+        result["proposed_order"] = {
+            "product_id": product_id,
+            "side": "SELL",
+            "base_size": exit_base_size,
+            "reason": sell_reason,
+            "order_type": "LIMIT_POST_ONLY" if use_limit else "MARKET_IOC",
+            "limit_price": limit_price,
+        }
+        result["preview"] = (
+            api.preview_limit(product_id, "SELL", limit_price, base_size=exit_base_size, post_only=post_only)
+            if use_limit else api.preview_market(product_id, "SELL", base_size=exit_base_size)
+        )
+        replacement: dict[str, Any] | None = pos
+        gate = api.live_gates_open(cfg, live)
+        if gate:
+            result["decision"] = gate
+        else:
+            order = (
+                api.place_limit(product_id, "SELL", limit_price, base_size=exit_base_size, post_only=post_only)
+                if use_limit else api.place_market(product_id, "SELL", base_size=exit_base_size)
+            )
+            result["order"] = order
+            tagged = {"source": source} if source else {}
+            if order.get("success") is True:
+                oid = api.order_id_from_response(order)
+                if use_limit:
+                    result["decision"] = "LIMIT_ORDER_PLACED"
+                    pending_position = dict(pos)
+                    if sell_reason == scale_exit_reason:
+                        pending_position["scale_exit_pending_order_id"] = oid
+                        replacement = pending_position
+                    state.setdefault("pending_orders", []).append({
+                        "order_id": oid, "product_id": product_id, "side": "SELL", "reason": sell_reason,
+                        "base_size": exit_base_size, "limit_price": limit_price, "placed_at": ts,
+                        "position": pending_position, "order_type": "LIMIT_POST_ONLY", **tagged,
+                    })
+                else:
+                    fill = api.market_fill_details(oid)
+                    filled_size = fnum(fill.get("filled_size")) or exit_base_size
+                    realized = api.realized_pnl_quote(cfg, pos, filled_size, fill, current)
+                    api.record_realized_pnl(state, realized, ts)
+                    result["fill"] = fill
+                    result["realized_pnl_quote"] = realized
+                    if sell_reason == scale_exit_reason:
+                        result["decision"] = "PARTIAL_EXIT_SENT"
+                        replacement = api.apply_partial_exit_fill(pos, filled_size, ts)
+                    else:
+                        result["decision"] = "ORDER_SENT"
+                        state["cooldown_until"] = (api.utcnow() + timedelta(minutes=float(cfg["cooldown_minutes_after_trade"]))).isoformat()
+                        if sell_reason in STOP_LIKE_REASONS:
+                            api.set_product_cooldown(state, product_id, float(cfg.get("per_product_cooldown_minutes_after_stop", 720)))
+                        else:
+                            api.set_product_cooldown(state, product_id, float(cfg.get("per_product_cooldown_minutes_after_trade", 180)))
+                        replacement = None
+                    api.append_jsonl(trades_log, {
+                        "ts": ts, "side": "SELL", "reason": sell_reason, "order": order, "position": pos,
+                        "base_size": filled_size, "order_type": "MARKET_IOC", "fill": fill,
+                        "realized_pnl_quote": realized, **tagged,
+                    })
+            else:
+                result["decision"] = "ORDER_FAILED"
+                api.append_jsonl(trades_log, {
+                    "ts": ts, "side": "SELL", "reason": sell_reason, "order": order, "position": pos,
+                    "failed": True, **tagged,
+                })
+        api.persist_positions(state, api.replace_position(positions, pos, replacement))
+        return True
+
+    api.persist_positions(state, held)
+    return False

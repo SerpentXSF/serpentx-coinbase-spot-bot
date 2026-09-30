@@ -52,6 +52,7 @@ from indicators import (  # noqa: E402,F401  (re-exported: other scripts use bot
     rsi,
     rsi_divergence,
 )
+import exits  # noqa: E402
 
 BASE_HOST = "api.coinbase.com"
 BASE_URL = f"https://{BASE_HOST}"
@@ -1872,89 +1873,9 @@ def run(cfg: dict[str, Any], *, status: bool=False, live: bool=False) -> dict[st
     # First priority: manage exits for existing bot-opened positions. Only one
     # live order is sent per run, so exits take precedence over new entries.
     if positions and not status and result["decision"] != "PENDING_ORDER_OPEN":
-        updated_positions: list[dict[str, Any]] = []
-        for pos in positions:
-            pos_product = str(pos.get("product_id"))
-            base, _, _ = pos_product.partition("-")
-            entry = fnum(pos.get("entry_price"))
-            current = fnum(product_info(pos_product).get("price")) if pos_product else 0.0
-            base_size = min(fnum(pos.get("base_size_est")), balances.get(base, 0.0))
-            pnl_pct = ((current - entry) / entry) if entry > 0 and current > 0 else 0.0
-            sell_reason = None
-            exit_base_size = base_size
-            scale_reason, scale_size = scale_exit_plan(cfg, pos, current, entry, base_size)
-            if scale_reason:
-                sell_reason = scale_reason
-                exit_base_size = scale_size
-            elif pnl_pct >= float(cfg["take_profit_pct"]):
-                sell_reason = "TAKE_PROFIT"
-            elif pnl_pct <= -float(cfg["stop_loss_pct"]):
-                sell_reason = "STOP_LOSS"
-            else:
-                structural_reason = structural_exit_reason(cfg, pos, current, entry)
-                if structural_reason:
-                    sell_reason = structural_reason
-                    try:
-                        pos_signal = apply_context_scores(cfg, score_product(cfg, pos_product), context_cache)
-                        result["position_signal"] = pos_signal.__dict__
-                    except Exception as e:
-                        result["position_signal_error"] = str(e)[:200]
-            trailing_reason = trailing_exit_reason(cfg, pos, current, entry)
-            if trailing_reason and not sell_reason:
-                sell_reason = trailing_reason
-            enriched = {**pos, "current_price": current, "pnl_pct": pnl_pct}
-            if sell_reason and exit_base_size > 0:
-                result["open_position"] = enriched
-                use_limit = should_use_maker_limit(cfg, "SELL", sell_reason)
-                limit_price = maker_limit_price(cfg, pos_product, "SELL", current) if use_limit else None
-                result["proposed_order"] = {"product_id": pos_product, "side": "SELL", "base_size": exit_base_size, "reason": sell_reason, "order_type": "LIMIT_POST_ONLY" if use_limit else "MARKET_IOC", "limit_price": limit_price}
-                result["preview"] = preview_limit(pos_product, "SELL", limit_price, base_size=exit_base_size, post_only=bool(cfg.get("maker_limit_post_only", True))) if use_limit else preview_market(pos_product, "SELL", base_size=exit_base_size)
-                gate = live_gates_open(cfg, live)
-                replacement: dict[str, Any] | None = pos
-                if gate:
-                    result["decision"] = gate
-                else:
-                    order = place_limit(pos_product, "SELL", limit_price, base_size=exit_base_size, post_only=bool(cfg.get("maker_limit_post_only", True))) if use_limit else place_market(pos_product, "SELL", base_size=exit_base_size)
-                    result["order"] = order
-                    scale_exit_reason = str(cfg.get("scale_exit_reason", "SCALE_TAKE_PROFIT"))
-                    if order.get("success") is True:
-                        oid = order_id_from_response(order)
-                        if use_limit:
-                            result["decision"] = "LIMIT_ORDER_PLACED"
-                            pending_position = dict(pos)
-                            if sell_reason == scale_exit_reason:
-                                pending_position["scale_exit_pending_order_id"] = oid
-                                replacement = pending_position
-                            state.setdefault("pending_orders", []).append({"order_id": oid, "product_id": pos_product, "side": "SELL", "reason": sell_reason, "base_size": exit_base_size, "limit_price": limit_price, "placed_at": result["ts"], "position": pending_position, "order_type": "LIMIT_POST_ONLY"})
-                        else:
-                            fill = market_fill_details(oid)
-                            filled_size = fnum(fill.get("filled_size")) or exit_base_size
-                            realized = realized_pnl_quote(cfg, pos, filled_size, fill, current)
-                            record_realized_pnl(state, realized, result["ts"])
-                            result["fill"] = fill
-                            result["realized_pnl_quote"] = realized
-                            if sell_reason == scale_exit_reason:
-                                result["decision"] = "PARTIAL_EXIT_SENT"
-                                replacement = apply_partial_exit_fill(pos, filled_size, result["ts"])
-                            else:
-                                result["decision"] = "ORDER_SENT"
-                                state["cooldown_until"] = (utcnow() + timedelta(minutes=float(cfg["cooldown_minutes_after_trade"]))).isoformat()
-                                if sell_reason in {"STOP_LOSS", "SOFT_INVALIDATION", "TRAILING_STOP", "BREAKEVEN_LOCK"}:
-                                    set_product_cooldown(state, pos_product, float(cfg.get("per_product_cooldown_minutes_after_stop", 720)))
-                                else:
-                                    set_product_cooldown(state, pos_product, float(cfg.get("per_product_cooldown_minutes_after_trade", 180)))
-                                replacement = None
-                            append_jsonl(Path(cfg["trades_log_path"]), {"ts": result["ts"], "side": "SELL", "reason": sell_reason, "order": order, "position": pos, "base_size": filled_size, "order_type": "MARKET_IOC", "fill": fill, "realized_pnl_quote": realized})
-                    else:
-                        result["decision"] = "ORDER_FAILED"
-                        append_jsonl(Path(cfg["trades_log_path"]), {"ts": result["ts"], "side": "SELL", "reason": sell_reason, "order": order, "position": pos, "failed": True})
-                persist_positions(state, replace_position(positions, pos, replacement))
-                break
-            updated_positions.append(pos)
-        else:
-            persist_positions(state, updated_positions)
+        if not exits.manage_exits(sys.modules[__name__], cfg, state, positions, balances, result, live=live, context_cache=context_cache):
             # No exits; continue below only if another entry slot is available.
-            if len(updated_positions) >= max_positions:
+            if len(positions) >= max_positions:
                 result["decision"] = "HOLD_POSITIONS"
 
     if result["decision"] in {"SHADOW_ONLY", "HOLD_POSITIONS"} and status:
