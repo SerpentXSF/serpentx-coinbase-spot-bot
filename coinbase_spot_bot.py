@@ -16,6 +16,7 @@ import os
 import re
 import secrets
 import sys
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -36,6 +37,28 @@ except Exception:  # keep public/shadow analysis usable if auth libs are missing
     serialization = None
     ec = None
     ed25519 = None
+
+# Shared modules live next to this file; make them importable even when the
+# bot is loaded by path from another working directory or wrapper script.
+_CODE_DIR = str(Path(__file__).resolve().parent)
+if _CODE_DIR not in sys.path:
+    sys.path.insert(0, _CODE_DIR)
+
+from indicators import (  # noqa: E402,F401  (re-exported: other scripts use bot.ema etc.)
+    _avg_range_pct,
+    _rsi_series,
+    _swing_points,
+    ema,
+    fnum,
+    rsi,
+    rsi_divergence,
+    rsi_for,
+    rsi_wilder,
+)
+import alerts  # noqa: E402
+import config_check  # noqa: E402
+import exchange_stops  # noqa: E402
+import exits  # noqa: E402
 
 BASE_HOST = "api.coinbase.com"
 BASE_URL = f"https://{BASE_HOST}"
@@ -76,11 +99,25 @@ def resolve_runtime_paths(cfg: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def load_config(path: str | Path) -> dict[str, Any]:
+def load_config(path: str | Path, required: set[str] | None = None) -> dict[str, Any]:
+    """Load config.json, failing fast if a key this caller needs is missing.
+
+    ``required`` defaults to every key the full bot reads; the exit monitor
+    passes the smaller set it uses so a missing entry-only key never stops
+    stop-loss management.
+    """
     p = Path(path)
     if not p.exists():
         raise RuntimeError(f"Config not found: {p}. Create it with: cp config.example.json config.json")
-    return resolve_runtime_paths(load_json(p))
+    try:
+        raw = load_json(p)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"{p} is not valid JSON: {exc}") from exc
+    needed = config_check.REQUIRED if required is None else required
+    missing = [f"missing required key '{k}'" for k in sorted(needed - set(raw))]
+    if missing:
+        raise RuntimeError(f"{p}: " + "; ".join(missing) + ". Compare with config.example.json or run: python config_check.py")
+    return resolve_runtime_paths(raw)
 
 
 def save_json(path: Path, data: dict[str, Any]) -> None:
@@ -157,6 +194,37 @@ def append_jsonl(path: Path, data: dict[str, Any]) -> None:
         f.write(json.dumps(data, sort_keys=True) + "\n")
 
 
+def append_jsonl_rotating(path: Path, data: dict[str, Any], max_bytes: int = 10_000_000, backups: int = 5) -> None:
+    """Append like append_jsonl, rotating ``path`` -> ``path.1`` .. ``path.N`` once it reaches ``max_bytes``.
+
+    Used for the high-volume runs log only; trades.jsonl is never rotated
+    because it is the P&L history the dashboard and reconciler read.
+    """
+    path = Path(path)
+    try:
+        if max_bytes > 0 and path.exists() and path.stat().st_size >= max_bytes:
+            for i in range(backups - 1, 0, -1):
+                src = path.with_name(f"{path.name}.{i}")
+                if src.exists():
+                    src.replace(path.with_name(f"{path.name}.{i + 1}"))
+            if backups > 0:
+                path.replace(path.with_name(f"{path.name}.1"))
+            else:
+                path.unlink()
+    except OSError:
+        pass  # never let log housekeeping block a trading run
+    append_jsonl(path, data)
+
+
+def append_run_log(cfg: dict[str, Any], data: dict[str, Any]) -> None:
+    append_jsonl_rotating(
+        Path(cfg["runs_log_path"]),
+        data,
+        int(cfg.get("runs_log_max_bytes", 10_000_000)),
+        int(cfg.get("runs_log_backups", 5)),
+    )
+
+
 def load_dotenv(path: str | Path) -> None:
     p = Path(path)
     if not p.exists():
@@ -208,11 +276,47 @@ def env_present() -> dict[str, bool]:
     }
 
 
+_HTTP_LOCAL = threading.local()
+
+
+def http() -> requests.Session:
+    """A keep-alive session for Coinbase calls, one per thread.
+
+    A run makes ~20 Coinbase requests; reusing one TLS connection instead of
+    opening a new one per call saves a handshake each time. Sessions are
+    per-thread because requests.Session is not thread-safe and the dashboard
+    serves requests from several threads.
+    """
+    session = getattr(_HTTP_LOCAL, "session", None)
+    if session is None:
+        session = _HTTP_LOCAL.session = requests.Session()
+    return session
+
+
+def _note_server_date(r: Any) -> None:
+    """Refresh the JWT clock-skew offset from any Coinbase response's Date header.
+
+    Every response carries one, so coinbase_epoch_now() rarely needs its own
+    request. Same rule as before: ignore skew under 30s.
+    """
+    try:
+        server_date = r.headers.get("Date")
+        if not server_date:
+            return
+        now = time.time()
+        offset = parsedate_to_datetime(server_date).timestamp() - now
+        _COINBASE_TIME_OFFSET["value"] = offset if abs(offset) > 30 else 0.0
+        _COINBASE_TIME_OFFSET["checked_at"] = now
+    except Exception:
+        pass
+
+
 def public_get(path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
     last_status = None
     last_data: dict[str, Any] = {}
     for attempt in range(4):
-        r = requests.get(BASE_URL + path, params=params, timeout=30)
+        r = http().get(BASE_URL + path, params=params, timeout=30)
+        _note_server_date(r)
         try:
             data = r.json()
         except Exception:
@@ -266,7 +370,7 @@ def coinbase_epoch_now() -> int:
     if now - float(_COINBASE_TIME_OFFSET.get("checked_at") or 0) < 300:
         return int(now + float(_COINBASE_TIME_OFFSET.get("value") or 0))
     try:
-        r = requests.get(BASE_URL + "/api/v3/brokerage/market/products/BTC-USDC", timeout=10)
+        r = http().get(BASE_URL + "/api/v3/brokerage/market/products/BTC-USDC", timeout=10)
         server_date = r.headers.get("Date")
         if server_date:
             server_dt = parsedate_to_datetime(server_date)
@@ -299,7 +403,7 @@ def build_jwt(method: str, path: str) -> str:
 def private_request(method: str, path: str, body: dict[str, Any] | None = None, params: dict[str, Any] | None = None) -> dict[str, Any]:
     method = method.upper()
     token = build_jwt(method, path)
-    r = requests.request(
+    r = http().request(
         method,
         BASE_URL + path,
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
@@ -307,6 +411,7 @@ def private_request(method: str, path: str, body: dict[str, Any] | None = None, 
         params=params,
         timeout=30,
     )
+    _note_server_date(r)
     try:
         data = r.json()
     except Exception:
@@ -314,114 +419,6 @@ def private_request(method: str, path: str, body: dict[str, Any] | None = None, 
     if r.status_code >= 400:
         raise RuntimeError(json.dumps({"status_code": r.status_code, "response": data}, indent=2))
     return data
-
-
-def fnum(x: Any, default: float = 0.0) -> float:
-    try:
-        return float(x)
-    except Exception:
-        return default
-
-
-def ema(vals: list[float], period: int) -> float:
-    if not vals:
-        return 0.0
-    k = 2 / (period + 1)
-    out = vals[0]
-    for v in vals[1:]:
-        out = v * k + out * (1 - k)
-    return out
-
-
-def rsi(vals: list[float], period: int = 14) -> float:
-    if len(vals) < period + 1:
-        return 50.0
-    gains, losses = [], []
-    for a, b in zip(vals[-period-1:-1], vals[-period:]):
-        d = b - a
-        gains.append(max(d, 0))
-        losses.append(max(-d, 0))
-    avg_gain = sum(gains) / period
-    avg_loss = sum(losses) / period
-    if avg_loss == 0:
-        return 100.0
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
-
-
-def _rsi_series(vals: list[float], period: int = 14) -> list[float | None]:
-    """Return simple rolling RSI values aligned to vals, using no paid APIs."""
-    out: list[float | None] = [None] * len(vals)
-    if len(vals) < period + 1:
-        return out
-    for i in range(period, len(vals)):
-        out[i] = rsi(vals[: i + 1], period)
-    return out
-
-
-def _swing_points(values: list[float], *, mode: str, window: int) -> list[int]:
-    idxs: list[int] = []
-    if window < 1 or len(values) < (window * 2 + 1):
-        return idxs
-    for i in range(window, len(values) - window):
-        segment = values[i - window : i + window + 1]
-        v = values[i]
-        if mode == "low":
-            if v == min(segment) and v < values[i - 1] and v <= values[i + 1]:
-                idxs.append(i)
-        else:
-            if v == max(segment) and v > values[i - 1] and v >= values[i + 1]:
-                idxs.append(i)
-    return idxs
-
-
-def rsi_divergence(candles: list[dict[str, Any]], period: int = 14, swing_window: int = 2, lookback: int = 80) -> dict[str, Any]:
-    """Detect classic RSI divergence from local candle closes.
-
-    Bullish Divergence: price makes a lower swing low while RSI makes a higher low.
-    Bearish Divergence: price makes a higher swing high while RSI makes a lower high.
-    This is a free/local technical metric; it uses only the candles already fetched
-    from Coinbase and never calls an extra provider.
-    """
-    closes = [fnum(c.get("close")) for c in candles if fnum(c.get("close")) > 0]
-    closes = closes[-lookback:]
-    neutral = {
-        "signal": "none",
-        "label": "None",
-        "previous_price": None,
-        "latest_price": None,
-        "previous_rsi": None,
-        "latest_rsi": None,
-        "previous_index": None,
-        "latest_index": None,
-    }
-    if len(closes) < max(period + 3, swing_window * 2 + 3):
-        return neutral
-    rsis = _rsi_series(closes, period)
-
-    def pair_payload(signal: str, label: str, a: int, b: int) -> dict[str, Any]:
-        return {
-            "signal": signal,
-            "label": label,
-            "previous_price": closes[a],
-            "latest_price": closes[b],
-            "previous_rsi": rsis[a],
-            "latest_rsi": rsis[b],
-            "previous_index": a,
-            "latest_index": b,
-        }
-
-    lows = [i for i in _swing_points(closes, mode="low", window=swing_window) if rsis[i] is not None]
-    highs = [i for i in _swing_points(closes, mode="high", window=swing_window) if rsis[i] is not None]
-    recent_lows = lows[-4:]
-    recent_highs = highs[-4:]
-    for a, b in zip(recent_lows, recent_lows[1:]):
-        if closes[b] < closes[a] and (rsis[b] or 0) > (rsis[a] or 0):
-            return pair_payload("bullish", "Bullish Divergence", a, b)
-    for a, b in zip(recent_highs, recent_highs[1:]):
-        if closes[b] > closes[a] and (rsis[b] or 0) < (rsis[a] or 0):
-            return pair_payload("bearish", "Bearish Divergence", a, b)
-    return neutral
 
 
 def fetch_candles(product_id: str, granularity: str, lookback_hours: int) -> list[dict[str, Any]]:
@@ -436,8 +433,24 @@ def fetch_candles(product_id: str, granularity: str, lookback_hours: int) -> lis
     return candles
 
 
+PRODUCT_INFO_TTL_SECONDS = 5.0
+_PRODUCT_INFO_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+
+
 def product_info(product_id: str) -> dict[str, Any]:
-    return public_get(f"/api/v3/brokerage/market/products/{product_id}")
+    """Ticker/product info, cached for a few seconds.
+
+    Within one run the same product is often looked up twice (scored as a
+    candidate, then priced for its exit check); a 5 s cache removes the repeat
+    without letting a stale price reach a later run.
+    """
+    hit = _PRODUCT_INFO_CACHE.get(product_id)
+    now = time.monotonic()
+    if hit and now - hit[0] < PRODUCT_INFO_TTL_SECONDS:
+        return hit[1]
+    data = public_get(f"/api/v3/brokerage/market/products/{product_id}")
+    _PRODUCT_INFO_CACHE[product_id] = (now, data)
+    return data
 
 
 def product_metadata(product_id: str, ttl_seconds: int = 86400) -> dict[str, Any]:
@@ -947,17 +960,6 @@ class Signal:
     rsi_divergence_signal: str = "none"
 
 
-def _avg_range_pct(candles: list[dict[str, Any]], limit: int = 20) -> float:
-    ranges = []
-    for c in candles[-limit:]:
-        close = fnum(c.get("close"))
-        high = fnum(c.get("high"))
-        low = fnum(c.get("low"))
-        if close > 0 and high > 0 and low > 0:
-            ranges.append((high - low) / close)
-    return sum(ranges) / len(ranges) if ranges else 0.0
-
-
 def _apply_five_minute_confirmation(cfg: dict[str, Any], sig: Signal) -> Signal:
     if not cfg.get("five_minute_confirmation_enabled", False):
         return sig
@@ -1018,36 +1020,42 @@ def _apply_fee_guard(cfg: dict[str, Any], sig: Signal) -> Signal:
     return sig
 
 
-def score_product(cfg: dict[str, Any], product_id: str) -> Signal:
-    info = product_info(product_id)
-    if not is_market_orderable_product(info):
-        s = Signal(product_id, fnum(info.get("price")), 0, "HOLD_USDC", ["product not market-orderable"], 50, fnum(info.get("price_percentage_change_24h")), fnum(info.get("volume_24h")))
-        s.risk_block = True
-        return s
-    exec_c = fetch_candles(product_id, cfg["bar_exec"], int(cfg["lookback_exec_hours"]))
-    trend_c = fetch_candles(product_id, cfg["bar_trend"], int(cfg["lookback_trend_hours"]))
+def technical_long_score(cfg: dict[str, Any], exec_c: list[dict[str, Any]], trend_c: list[dict[str, Any]], price: float | None, chg: float, vol: float) -> dict[str, Any]:
+    """The bot's candle-based long score, with no network calls.
+
+    Shared by score_product() and the USDC scanner so the rotator ranks
+    products by the same rules (timeframes, EMA stack, 30m regime gate, RSI,
+    divergence) the bot applies before buying. ``price`` falls back to the last
+    exec close only when it is None (missing/unparseable ticker price).
+    """
     closes = [fnum(c.get("close")) for c in exec_c if fnum(c.get("close")) > 0]
     trend_closes = [fnum(c.get("close")) for c in trend_c if fnum(c.get("close")) > 0]
-    price = fnum(info.get("price"), closes[-1] if closes else 0)
+    if price is None:
+        price = closes[-1] if closes else 0.0
     avg_exec_range = _avg_range_pct(exec_c)
+    out: dict[str, Any] = {"price": price, "avg_exec_range_pct": avg_exec_range, "insufficient": False}
     if len(closes) < 30 or len(trend_closes) < 20 or price <= 0:
-        return Signal(product_id, price, 0, "HOLD", ["insufficient candle history"], 50, fnum(info.get("price_percentage_change_24h")), fnum(info.get("volume_24h")), avg_exec_range_pct=avg_exec_range)
+        out.update({"insufficient": True, "score": 0, "reasons": ["insufficient candle history"], "rsi": 50.0,
+                    "regime_block": False, "rsi_divergence": {}, "rsi_divergence_label": "None", "rsi_divergence_signal": "none"})
+        return out
     ema9 = ema(closes[-60:], 9)
     ema21 = ema(closes[-80:], 21)
     ema50 = ema(closes[-120:], 50)
     trend20 = ema(trend_closes[-80:], 20)
     trend50 = ema(trend_closes[-120:], 50)
-    cur_rsi = rsi(closes, 14)
-    divergence = rsi_divergence(
-        exec_c,
-        period=int(cfg.get("rsi_divergence_period", 14)),
-        swing_window=int(cfg.get("rsi_divergence_swing_window", 2)),
-        lookback=int(cfg.get("rsi_divergence_lookback_candles", 80)),
-    )
-    chg = fnum(info.get("price_percentage_change_24h"))
-    vol = fnum(info.get("volume_24h"))
+    cur_rsi = rsi_for(cfg, closes, 14)
+    if cfg.get("rsi_divergence_enabled", True):
+        divergence = rsi_divergence(
+            exec_c,
+            period=int(cfg.get("rsi_divergence_period", 14)),
+            swing_window=int(cfg.get("rsi_divergence_swing_window", 2)),
+            lookback=int(cfg.get("rsi_divergence_lookback_candles", 80)),
+            method=str(cfg.get("rsi_method", "simple")),
+        )
+    else:
+        divergence = {"label": "None", "signal": "none", "disabled": True}
     score = 0
-    reasons = []
+    reasons: list[str] = []
 
     # Spot-only: buy strength on trend alignment or controlled pullbacks; otherwise hold USDC.
     if ema9 > ema21 > ema50:
@@ -1077,6 +1085,35 @@ def score_product(cfg: dict[str, Any], product_id: str) -> Signal:
         score += 1; reasons.append("active volume")
     if avg_exec_range >= float(cfg.get("min_avg_exec_range_pct", 0.0)):
         reasons.append(f"avg exec range {avg_exec_range*100:.2f}%")
+    out.update({
+        "score": score,
+        "reasons": reasons,
+        "rsi": cur_rsi,
+        "regime_block": any("regime gate failed" in r for r in reasons),
+        "rsi_divergence": divergence,
+        "rsi_divergence_label": div_label,
+        "rsi_divergence_signal": div_signal,
+        "ema9": ema9, "ema21": ema21, "ema50": ema50, "trend_ema20": trend20, "trend_ema50": trend50,
+    })
+    return out
+
+
+def score_product(cfg: dict[str, Any], product_id: str) -> Signal:
+    info = product_info(product_id)
+    if not is_market_orderable_product(info):
+        s = Signal(product_id, fnum(info.get("price")), 0, "HOLD_USDC", ["product not market-orderable"], 50, fnum(info.get("price_percentage_change_24h")), fnum(info.get("volume_24h")))
+        s.risk_block = True
+        return s
+    exec_c = fetch_candles(product_id, cfg["bar_exec"], int(cfg["lookback_exec_hours"]))
+    trend_c = fetch_candles(product_id, cfg["bar_trend"], int(cfg["lookback_trend_hours"]))
+    chg = fnum(info.get("price_percentage_change_24h"))
+    vol = fnum(info.get("volume_24h"))
+    tech = technical_long_score(cfg, exec_c, trend_c, fnum(info.get("price"), None), chg, vol)
+    if tech["insufficient"]:
+        return Signal(product_id, tech["price"], 0, "HOLD", ["insufficient candle history"], 50, chg, vol, avg_exec_range_pct=tech["avg_exec_range_pct"])
+    score = tech["score"]
+    reasons = tech["reasons"]
+    price = tech["price"]
     htf = cfg.get("higher_timeframe_regime_gate", {})
     if htf.get("enabled"):
         try:
@@ -1099,13 +1136,13 @@ def score_product(cfg: dict[str, Any], product_id: str) -> Signal:
             reasons.append(f"higher timeframe gate unavailable: {str(exc)[:80]}")
     regime_block = any("regime gate failed" in r for r in reasons)
     action = "BUY" if score >= int(cfg["score_threshold"]) and not regime_block else "HOLD_USDC"
-    sig = Signal(product_id, price, score, action, reasons, cur_rsi, chg, vol, avg_exec_range_pct=avg_exec_range)
+    sig = Signal(product_id, price, score, action, reasons, tech["rsi"], chg, vol, avg_exec_range_pct=tech["avg_exec_range_pct"])
     if regime_block:
         sig.risk_block = True
         sig.reasons.append("regime gate blocked long entry")
-    sig.rsi_divergence = divergence
-    sig.rsi_divergence_label = div_label
-    sig.rsi_divergence_signal = div_signal
+    sig.rsi_divergence = tech["rsi_divergence"]
+    sig.rsi_divergence_label = tech["rsi_divergence_label"]
+    sig.rsi_divergence_signal = tech["rsi_divergence_signal"]
     if sig.action == "BUY":
         sig = _apply_five_minute_confirmation(cfg, sig)
         sig = _apply_fee_guard(cfg, sig)
@@ -1280,6 +1317,47 @@ def fetch_order_detail(order_id: str) -> dict[str, Any]:
 
 def cancel_order(order_id: str) -> dict[str, Any]:
     return private_request("POST", "/api/v3/brokerage/orders/batch_cancel", {"order_ids": [order_id]})
+
+
+def cancel_succeeded(resp: dict[str, Any], order_id: str) -> bool:
+    """True when a batch_cancel response reports success for ``order_id``."""
+    for row in resp.get("results") or []:
+        if str(row.get("order_id")) == str(order_id):
+            return bool(row.get("success"))
+    return False
+
+
+def stop_limit_order_config(product_id: str, base_size: float, stop_price: float, limit_price: float) -> dict[str, Any]:
+    """Coinbase stop-limit GTC SELL that triggers when the price falls to ``stop_price``.
+
+    Field names follow Coinbase's official SDK (stop_limit_stop_limit_gtc).
+    Every placement is previewed first, so Coinbase validates this shape
+    before any real order is sent.
+    """
+    b = quantize_order_size(product_id, "base_size", base_size)
+    if _decimal_from(b) <= 0:
+        raise RuntimeError(f"{product_id} stop base_size is below Coinbase minimum after quantization")
+    stop_s = _quantize_price(product_id, stop_price)
+    limit_s = _quantize_price(product_id, limit_price)
+    if _decimal_from(stop_s) <= 0 or _decimal_from(limit_s) <= 0:
+        raise RuntimeError(f"{product_id} stop/limit price quantized to zero")
+    return {"stop_limit_stop_limit_gtc": {
+        "base_size": b,
+        "limit_price": limit_s,
+        "stop_price": stop_s,
+        "stop_direction": "STOP_DIRECTION_STOP_DOWN",
+    }}
+
+
+def preview_stop_limit(product_id: str, base_size: float, stop_price: float, limit_price: float) -> dict[str, Any]:
+    oc = stop_limit_order_config(product_id, base_size, stop_price, limit_price)
+    return private_request("POST", "/api/v3/brokerage/orders/preview", {"product_id": product_id, "side": "SELL", "order_configuration": oc})
+
+
+def place_stop_limit(product_id: str, base_size: float, stop_price: float, limit_price: float) -> dict[str, Any]:
+    oc = stop_limit_order_config(product_id, base_size, stop_price, limit_price)
+    body = {"client_order_id": str(uuid.uuid4()), "product_id": product_id, "side": "SELL", "order_configuration": oc}
+    return private_request("POST", "/api/v3/brokerage/orders", body)
 
 
 def normalize_pending_orders(state: dict[str, Any]) -> list[dict[str, Any]]:
@@ -1476,7 +1554,8 @@ def dynamic_quote_size(cfg: dict[str, Any], quote_bal: float, top: Signal) -> fl
 def live_gates_open(cfg: dict[str, Any], live: bool) -> str | None:
     if not live:
         return "PREVIEW_ONLY"
-    if not cfg.get("active_trading"):
+    # Require a real JSON true: a string such as "false" is truthy in Python.
+    if cfg.get("active_trading") is not True:
         return "LIVE_BLOCKED_CONFIG_ACTIVE_TRADING_FALSE"
     if os.getenv("COINBASE_TRADING_ENABLED") != "1":
         return "LIVE_BLOCKED_ENV_TRADING_DISABLED"
@@ -1886,12 +1965,14 @@ def run(cfg: dict[str, Any], *, status: bool=False, live: bool=False) -> dict[st
     max_positions = int(cfg.get("max_open_positions", 1))
     result["daily_trades_used"] = daily_trades
     result["daily_realized_pnl"] = state.get("daily_realized_pnl")
-    result["live_gates"] = {"--live": bool(live), "config_active_trading": bool(cfg.get("active_trading")), "env_COINBASE_TRADING_ENABLED": os.getenv("COINBASE_TRADING_ENABLED") == "1"}
+    result["live_gates"] = {"--live": bool(live), "config_active_trading": cfg.get("active_trading") is True, "env_COINBASE_TRADING_ENABLED": os.getenv("COINBASE_TRADING_ENABLED") == "1"}
     result["open_positions"] = positions
     result["pending_orders"] = pending_orders
 
-    if pending_orders and not status:
-        result["decision"] = "PENDING_ORDER_OPEN"
+    config_report = config_check.validate(cfg)
+    if config_report["errors"] or config_report["warnings"]:
+        result["config_check"] = config_report
+
 
     if status and positions:
         enriched_positions = []
@@ -1912,99 +1993,38 @@ def run(cfg: dict[str, Any], *, status: bool=False, live: bool=False) -> dict[st
 
     # First priority: manage exits for existing bot-opened positions. Only one
     # live order is sent per run, so exits take precedence over new entries.
-    if positions and not status and result["decision"] != "PENDING_ORDER_OPEN":
-        updated_positions: list[dict[str, Any]] = []
-        for pos in positions:
-            pos_product = str(pos.get("product_id"))
-            base, _, _ = pos_product.partition("-")
-            entry = fnum(pos.get("entry_price"))
-            current = fnum(product_info(pos_product).get("price")) if pos_product else 0.0
-            base_size = min(fnum(pos.get("base_size_est")), balances.get(base, 0.0))
-            pnl_pct = ((current - entry) / entry) if entry > 0 and current > 0 else 0.0
-            sell_reason = None
-            exit_base_size = base_size
-            scale_reason, scale_size = scale_exit_plan(cfg, pos, current, entry, base_size)
-            if scale_reason:
-                sell_reason = scale_reason
-                exit_base_size = scale_size
-            elif pnl_pct >= float(cfg["take_profit_pct"]):
-                sell_reason = "TAKE_PROFIT"
-            elif pnl_pct <= -float(cfg["stop_loss_pct"]):
-                sell_reason = "STOP_LOSS"
-            else:
-                structural_reason = structural_exit_reason(cfg, pos, current, entry)
-                if structural_reason:
-                    sell_reason = structural_reason
-                    try:
-                        pos_signal = apply_context_scores(cfg, score_product(cfg, pos_product), context_cache)
-                        result["position_signal"] = pos_signal.__dict__
-                    except Exception as e:
-                        result["position_signal_error"] = str(e)[:200]
-            trailing_reason = trailing_exit_reason(cfg, pos, current, entry)
-            if trailing_reason and not sell_reason:
-                sell_reason = trailing_reason
-            enriched = {**pos, "current_price": current, "pnl_pct": pnl_pct}
-            if sell_reason and exit_base_size > 0:
-                result["open_position"] = enriched
-                use_limit = should_use_maker_limit(cfg, "SELL", sell_reason)
-                limit_price = maker_limit_price(cfg, pos_product, "SELL", current) if use_limit else None
-                result["proposed_order"] = {"product_id": pos_product, "side": "SELL", "base_size": exit_base_size, "reason": sell_reason, "order_type": "LIMIT_POST_ONLY" if use_limit else "MARKET_IOC", "limit_price": limit_price}
-                result["preview"] = preview_limit(pos_product, "SELL", limit_price, base_size=exit_base_size, post_only=bool(cfg.get("maker_limit_post_only", True))) if use_limit else preview_market(pos_product, "SELL", base_size=exit_base_size)
-                gate = live_gates_open(cfg, live)
-                replacement: dict[str, Any] | None = pos
-                if gate:
-                    result["decision"] = gate
-                else:
-                    order = place_limit(pos_product, "SELL", limit_price, base_size=exit_base_size, post_only=bool(cfg.get("maker_limit_post_only", True))) if use_limit else place_market(pos_product, "SELL", base_size=exit_base_size)
-                    result["order"] = order
-                    scale_exit_reason = str(cfg.get("scale_exit_reason", "SCALE_TAKE_PROFIT"))
-                    if order.get("success") is True:
-                        oid = order_id_from_response(order)
-                        if use_limit:
-                            result["decision"] = "LIMIT_ORDER_PLACED"
-                            pending_position = dict(pos)
-                            if sell_reason == scale_exit_reason:
-                                pending_position["scale_exit_pending_order_id"] = oid
-                                replacement = pending_position
-                            state.setdefault("pending_orders", []).append({"order_id": oid, "product_id": pos_product, "side": "SELL", "reason": sell_reason, "base_size": exit_base_size, "limit_price": limit_price, "placed_at": result["ts"], "position": pending_position, "order_type": "LIMIT_POST_ONLY"})
-                        else:
-                            fill = market_fill_details(oid)
-                            filled_size = fnum(fill.get("filled_size")) or exit_base_size
-                            realized = realized_pnl_quote(cfg, pos, filled_size, fill, current)
-                            record_realized_pnl(state, realized, result["ts"])
-                            result["fill"] = fill
-                            result["realized_pnl_quote"] = realized
-                            if sell_reason == scale_exit_reason:
-                                result["decision"] = "PARTIAL_EXIT_SENT"
-                                replacement = apply_partial_exit_fill(pos, filled_size, result["ts"])
-                            else:
-                                result["decision"] = "ORDER_SENT"
-                                state["cooldown_until"] = (utcnow() + timedelta(minutes=float(cfg["cooldown_minutes_after_trade"]))).isoformat()
-                                if sell_reason in {"STOP_LOSS", "SOFT_INVALIDATION", "TRAILING_STOP", "BREAKEVEN_LOCK"}:
-                                    set_product_cooldown(state, pos_product, float(cfg.get("per_product_cooldown_minutes_after_stop", 720)))
-                                else:
-                                    set_product_cooldown(state, pos_product, float(cfg.get("per_product_cooldown_minutes_after_trade", 180)))
-                                replacement = None
-                            append_jsonl(Path(cfg["trades_log_path"]), {"ts": result["ts"], "side": "SELL", "reason": sell_reason, "order": order, "position": pos, "base_size": filled_size, "order_type": "MARKET_IOC", "fill": fill, "realized_pnl_quote": realized})
-                    else:
-                        result["decision"] = "ORDER_FAILED"
-                        append_jsonl(Path(cfg["trades_log_path"]), {"ts": result["ts"], "side": "SELL", "reason": sell_reason, "order": order, "position": pos, "failed": True})
-                persist_positions(state, replace_position(positions, pos, replacement))
-                break
-            updated_positions.append(pos)
-        else:
-            persist_positions(state, updated_positions)
+    # Exits are managed even while limit orders are pending: a resting maker
+    # order must never switch off stop-loss protection for open positions.
+    exit_fired = False
+    if positions and not status:
+        exchange_stops.sync(sys.modules[__name__], cfg, state, result, live=live)
+        positions = normalize_positions(state)
+    if positions and not status:
+        exit_fired = exits.manage_exits(sys.modules[__name__], cfg, state, positions, balances, result, live=live, context_cache=context_cache)
+    if not exit_fired and not status:
+        if normalize_pending_orders(state):
+            # No new entries while an order is still working.
+            result["decision"] = "PENDING_ORDER_OPEN"
+        elif positions and len(positions) >= max_positions:
             # No exits; continue below only if another entry slot is available.
-            if len(updated_positions) >= max_positions:
-                result["decision"] = "HOLD_POSITIONS"
+            result["decision"] = "HOLD_POSITIONS"
 
     if result["decision"] in {"SHADOW_ONLY", "HOLD_POSITIONS"} and status:
         result["decision"] = "STATUS_ONLY"
     elif result["decision"] == "SHADOW_ONLY":
+        # Re-read after exits: a backstop fill booked by exchange_stops.sync()
+        # this run sets a cooldown and counts as a trade.
+        cooldown_until = state.get("cooldown_until")
+        in_cooldown = cooldown_until and cooldown_until > utcnow().isoformat()
+        daily_trades = count_daily_trades(Path(cfg["trades_log_path"]))
+        result["daily_trades_used"] = daily_trades
         positions = normalize_positions(state)
         entry_signal = choose_entry_signal(cfg, signals, positions, state)
         if not balances:
             result["decision"] = "NEEDS_CREDENTIALS_FOR_PREVIEW_OR_TRADE"
+        elif config_report["errors"]:
+            # A broken risk setting must not open new positions; exits above still ran.
+            result["decision"] = "CONFIG_INVALID"
         elif in_cooldown:
             result["decision"] = "COOLDOWN"
             result["cooldown_until"] = cooldown_until
@@ -2063,6 +2083,7 @@ def run(cfg: dict[str, Any], *, status: bool=False, live: bool=False) -> dict[st
                                 "high_water_pnl_pct": 0.0,
                                 "entry_candle_low": min([fnum(c.get("low")) for c in fetch_candles(entry_signal.product_id, cfg.get("bar_exec", "FIFTEEN_MINUTE"), 4)[-4:] if fnum(c.get("low")) > 0] or [entry_signal.price]),
                             })
+                            exchange_stops.place(sys.modules[__name__], cfg, positions[-1], result, live=live)
                             persist_positions(state, positions)
                             append_jsonl(Path(cfg["trades_log_path"]), {"ts": result["ts"], "side": "BUY", "order": order, "signal": entry_signal.__dict__, "quote_size": quote_size, "order_type": "MARKET_IOC", "fill": fill})
                     else:
@@ -2076,7 +2097,7 @@ def run(cfg: dict[str, Any], *, status: bool=False, live: bool=False) -> dict[st
     state["last_decision"] = result["decision"]
     state["last_top"] = top.__dict__
     save_json(state_path, state)
-    append_jsonl(Path(cfg["runs_log_path"]), result)
+    append_run_log(cfg, result)
     return result
 
 
@@ -2092,6 +2113,9 @@ def summarize(result: dict[str, Any]) -> str:
         parts.append("Balances checked: " + ", ".join(f"{k}={v:.6g}" for k, v in sorted(result["balances"].items())))
     if "auth_status" in result:
         parts.append(f"Auth: {result['auth_status']}")
+    for level in ("errors", "warnings"):
+        for msg in (result.get("config_check") or {}).get(level, []):
+            parts.append(f"Config {level[:-1]}: {msg}")
     gates = result.get("live_gates") or {}
     if gates:
         parts.append("Live gates: " + ", ".join(f"{k}={'open' if v else 'closed'}" for k, v in gates.items()))
@@ -2110,18 +2134,29 @@ def main() -> None:
     ap.add_argument("--live", action="store_true", help="Attempt live order if all gates allow it")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
-    cfg = load_config(args.config)
-    if args.live and not args.status and cfg.get("active_trading"):
-        load_dotenv(cfg.get("env_file", ROOT / ".env"))
+    try:
+        cfg = load_config(args.config)
+    except Exception as exc:
+        # A broken config.json stops every run: that deserves an alert too.
+        load_dotenv(ROOT / ".env")
+        alerts.notify_error({"state_path": str(ROOT / "state" / "state.json")}, exc, source="bot")
+        raise
+    load_dotenv(cfg.get("env_file", ROOT / ".env"))  # early, so a crash can still alert
+    if args.live and not args.status and cfg.get("active_trading") is True:
         if os.getenv("COINBASE_TRADING_ENABLED") == "1":
             print("*** LIVE TRADING ENABLED: all three gates are open; real orders may be placed ***", file=sys.stderr)
     try:
         with run_lock_for(cfg):
-            result = run(cfg, status=args.status, live=args.live)
+            try:
+                result = run(cfg, status=args.status, live=args.live)
+            except Exception as exc:
+                alerts.notify_error(cfg, exc, source="bot")
+                raise
     except RunLocked as exc:
         skipped = {"ts": utcnow().isoformat(), "decision": "SKIPPED_RUN_LOCKED", "reason": str(exc)}
         print(json.dumps(skipped, indent=2, sort_keys=True) if args.json else f"Skipped: {exc}")
         return
+    alerts.notify_result(cfg, result, source="bot")
     print(json.dumps(result, indent=2, sort_keys=True) if args.json else summarize(result))
 
 

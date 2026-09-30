@@ -42,6 +42,10 @@ Technical scoring considers:
 - 24-hour momentum
 - Coinbase volume/liquidity
 
+RSI defaults to the bot's original simple 14-period average (`"rsi_method": "simple"`). Set `"rsi_method": "wilder"` to use Wilder's smoothed RSI, which is what TradingView and most charting sites show. The two can differ by several points on the same data.
+
+**Sizing note:** each entry is capped at `max_account_quote_pct_per_trade` (15%) of min(available USDC, `sizing_quote_balance_target` = 100), and must be at least `min_quote_per_trade` (15). With the example values, as soon as available USDC drops below 100 (after a small loss, or while 15 USDC sits in a first position), a threshold-score entry sizes below 15 and is skipped as `ORDER_TOO_SMALL`. Only stronger scores, which get a size multiplier, still trade. Keep more than `sizing_quote_balance_target` in USDC, or lower `min_quote_per_trade`, if you want threshold entries and a second position to go through.
+
 Optional public/free context can use:
 
 - Google News RSS headline keywords
@@ -72,6 +76,10 @@ Additional protections include:
 - **daily loss limit** — once today's (UTC) realized loss reaches `daily_max_loss_pct` of `sizing_quote_balance_target` (default 2.5% of 100 USDC = 2.50 USDC), new entries stop with `DAILY_LOSS_LIMIT_REACHED` until the next UTC day. Exits keep running.
 - **run lock** — the rotator/bot and the exit monitor share `state/run.lock`, so overlapping cron jobs skip (`SKIPPED_RUN_LOCKED`) instead of trading on the same state twice. A lock older than `run_lock_stale_seconds` (default 900) from a crashed run is taken over automatically.
 - **actual fill tracking** — after a market order the bot reads Coinbase's fill (average price, size, fees) and uses it for the position entry price and realized P&L, falling back to an estimate only if the fill is not reported yet.
+- **stop-losses keep working while orders are pending** — a resting maker entry or take-profit never pauses stop-loss management for the other positions. If a position's own resting limit sell is in the way of a stop-type exit, the bot cancels it and market-sells.
+- **optional Coinbase-held backstop** — with `exchange_stop_enabled: true`, each position also gets a stop-limit sell resting on Coinbase, so a crash, sleep, or network outage can't leave it unprotected. See [Coinbase-held backstop stops](#coinbase-held-backstop-stops).
+- **config validation** — `config.json` is checked on every run. Typos get a "did you mean" warning; dangerous values (such as `stop_loss_pct: 3.5` instead of `0.035`) block new entries (`CONFIG_INVALID`) while exits keep running. Check a file by hand with `python config_check.py`.
+- **alerts** — optional push notifications for real orders, the daily loss limit, config errors, and crashed runs. See [Alerts](#alerts).
 - daily trade cap
 - max open positions
 - min/max trade sizing
@@ -180,6 +188,9 @@ Leave blank if unused. The bot treats optional provider failures as fail-neutral
 | `DAILY_LOSS_LIMIT_REACHED` | Today's realized loss hit `daily_max_loss_pct`. Entries resume at 00:00 UTC; open positions are still managed. The running total is in `state/state.json` → `daily_realized_pnl`. |
 | `SKIPPED_RUN_LOCKED` | Another bot/exit-monitor run was active. The next scheduled run proceeds normally. If a run crashed, the lock is cleared after `run_lock_stale_seconds`. |
 | `ERROR: analyzer timed out` / `bot run timed out` | Coinbase was slow. Raise `rotator_analyzer_timeout_seconds` / `rotator_bot_timeout_seconds` in `config.json`. |
+| `CONFIG_INVALID` | `config.json` has an error that blocks new entries (exits keep running). Run `python config_check.py` to see what's wrong. |
+| `PENDING_CANCEL_FAILED` / `EXCHANGE_STOP_CANCEL_FAILED` | A stop-type exit needed to cancel a resting order first and Coinbase refused. Nothing was sold; the next run retries. Check the order in the Coinbase app if it repeats. |
+| `EXCHANGE_STOP_PLACE_FAILED` | Coinbase rejected the backstop order preview. The error is in the position's `exchange_stop_error` in `state/state.json`, and in your alert if enabled. |
 | One product shows `action: ERROR` | That product was delisted/renamed or its candles failed; the rest of the watchlist still runs. `rotate_and_run.py` refreshes the list. |
 
 ## Basic usage
@@ -203,6 +214,8 @@ python coinbase_spot_bot.py --config config.json
 ### Rotate watchlist and run preview
 
 Scans Coinbase USDC pairs, writes the top 5 to `allowed_products` in your `config.json` (other settings are preserved), then runs the bot in preview mode.
+
+The scanner uses the same candle timeframes as the bot (`bar_exec` / `bar_trend` and their lookbacks in `config.json`) and scores every pair with the bot's own technical scoring. Pairs the bot would actually accept (the 30m regime gate passes and the score is at least `score_threshold`) rank first. The scanner's liquidity/momentum score orders pairs within each group. Each row in `analysis/usdc_pairs_latest.json` shows `bot_score`, `bot_regime_ok` and `bot_eligible`.
 
 ```bash
 python rotate_and_run.py --json
@@ -248,6 +261,19 @@ If your live bot state is in another folder, point the dashboard at it without m
 COINBASE_BOT_ROOT=/path/to/your/local/bot python trade_analytics_dashboard.py --host 127.0.0.1 --port 8787
 ```
 
+### Strategy backtest
+
+Replay recent history through the bot's real entry and exit rules, with fees and slippage, before trusting a config with money:
+
+```bash
+python strategy_backtest.py --days 14
+python strategy_backtest.py --days 30 --products BTC-USDC,ETH-USDC --fee-per-side 0.006
+```
+
+It uses the bot's own scoring (5m confirmation, fee guard, regime gates), entry selection, sizing, cooldowns, daily limits, and the same exit engine the live bot uses. It only ever sees candles that had closed at each simulated moment, so there is no lookahead. Every fill pays `--fee-per-side` (default: your config's observed taker fee) plus `--slippage` (default 0.1%). The report covers win rate, average win/loss, expectancy per trade, profit factor, net P&L, fees, max drawdown, exit reasons, and why entries were blocked. It is saved to `analysis/strategy_backtest.json`, and candles are cached under `analysis/backtest_cache/`.
+
+Limitations, printed with every report: prices are checked on 5-minute closes (intrabar wicks are missed), historical news/social context isn't available (`--context neutral` scores it as zero), and it trades the fixed product list rather than the rotator's changing top 5.
+
 ### Candidate forward backtest
 
 Replay recent scanner output against later public candles to sanity-check candidate selection:
@@ -265,6 +291,27 @@ python reconcile_orders.py --limit 10 --json
 ```
 
 This writes `analysis/order_reconciliation.json` for the dashboard. It is intentionally manual/low-frequency to protect API limits.
+
+### Alerts
+
+Set `ALERT_WEBHOOK_URL` in `.env` to get a push message for:
+
+- real orders: sent, partial exit, limit placed, limit filled, failed (with side, product, size, reason, fill price, realized P&L)
+- the daily loss limit pausing entries, an invalid `config.json`, and Coinbase backstop fills or failures
+- a bot or exit-monitor run crashing
+
+Paste a Discord or Slack incoming-webhook URL, or an [ntfy](https://ntfy.sh) topic URL such as `https://ntfy.sh/your-secret-topic` (free phone push; use a hard-to-guess topic name). The format is detected from the host (`discord.com`, `hooks.slack.com`, `ntfy.sh`); for anything else, including a self-hosted ntfy server, set `ALERT_WEBHOOK_FORMAT` (`discord`, `slack`, `ntfy`, `json`). Preview runs never alert. Conditions that repeat every run are sent at most once per `alert_repeat_minutes` (default 360). A failing webhook never affects trading.
+
+### Coinbase-held backstop stops
+
+The bot's own stops only fire when a run happens and your machine is up. Setting `"exchange_stop_enabled": true` also places a Coinbase **stop-limit sell** for every open position, which Coinbase executes even if the bot is offline:
+
+- The backstop sits **below** the bot's own stop, at `stop_loss_pct` + `exchange_stop_buffer_pct` (default 3.5% + 1% = 4.5% below entry), with its limit `exchange_stop_limit_offset_pct` (1%) lower. Routine exits stay with the bot.
+- Before any bot exit, the backstop is cancelled so its coins can be sold. If it already filled, that fill is recorded as the exit instead of selling twice.
+- Each run checks every backstop. One that filled while the bot was down closes the position with real P&L. One that was cancelled or expired is re-placed.
+- Every order is **previewed with Coinbase first**. In preview mode the preview still runs, so check your run output for `EXCHANGE_STOP_PREVIEW_OK` before relying on it live.
+
+A stop-limit only sells at the limit price or better. In a very fast crash the price can gap through the limit, leaving the order unfilled. The bot's own market-order stop still applies whenever it is running.
 
 ### Live run
 
@@ -288,6 +335,8 @@ Before scheduling, create the local runtime folders. They are ignored by git so 
 ```bash
 mkdir -p state logs analysis
 ```
+
+`logs/runs.jsonl` gets a detailed entry on every run and exit-monitor tick, so it rotates automatically at `runs_log_max_bytes` (default 10 MB) and keeps `runs_log_backups` old files (default 5, named `runs.jsonl.1` ... `.5`). `logs/trades.jsonl` is your trade history and is never rotated.
 
 ### Linux/macOS cron
 
@@ -314,7 +363,13 @@ Any scheduler can run the same Python commands above. The project does not requi
 ## Files
 
 ```text
-coinbase_spot_bot.py      Main strategy bot
+coinbase_spot_bot.py      Main strategy bot (entry point; Coinbase access, scoring, entries)
+exits.py                  Exit engine shared by the bot and the exit monitor
+exchange_stops.py         Optional Coinbase-held backstop stop orders
+indicators.py             EMA / RSI / divergence math (no network)
+config_check.py           config.json validation (also runnable by hand)
+alerts.py                 Optional webhook alerts
+strategy_backtest.py      Replay history through the real entry/exit rules
 analyze_usdc_pairs.py     Public Coinbase USDC market scanner
 rotate_and_run.py         Refresh top-5 watchlist and run bot
 exit_monitor.py           Lightweight exit-only monitor
@@ -363,4 +418,4 @@ python -m unittest -v
 python coinbase_spot_bot.py --config config.example.json --status
 ```
 
-The unit tests include offline smoke tests (`test_offline_smoke.py`) that run every documented command against a fake Coinbase API, so they need no network or keys. GitHub Actions runs them on Python 3.10–3.13 for every push and pull request. The second command uses live public endpoints and optional providers; private account checks require your local `.env`.
+The unit tests include offline smoke tests (`test_offline_smoke.py`) that run every documented command against a fake Coinbase API, so they need no network or keys. Changes to exit logic are also checked by comparing old and new behaviour across hundreds of randomized scenarios. GitHub Actions runs them on Python 3.10–3.13 for every push and pull request. The second command uses live public endpoints and optional providers; private account checks require your local `.env`.

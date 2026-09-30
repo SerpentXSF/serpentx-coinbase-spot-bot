@@ -1,5 +1,6 @@
 {
   "active_trading": false,
+  "alert_repeat_minutes": 360,
   "allowed_products": [
     "BTC-USDC",
     "ETH-USDC",
@@ -62,6 +63,9 @@
   "entry_rotator_cadence_minutes": 90,
   "entry_trigger_mode": "5m_reclaim_ema9_after_pullback",
   "env_file": ".env",
+  "exchange_stop_buffer_pct": 0.01,
+  "exchange_stop_enabled": false,
+  "exchange_stop_limit_offset_pct": 0.01,
   "execution_mode": "maker_limit_preferred",
   "exit_monitor_cadence_minutes": 3,
   "expected_move_range_multiplier": 4.0,
@@ -150,7 +154,10 @@
   "rsi_divergence_lookback_candles": 80,
   "rsi_divergence_period": 14,
   "rsi_divergence_swing_window": 2,
+  "rsi_method": "simple",
   "run_lock_stale_seconds": 900,
+  "runs_log_backups": 5,
+  "runs_log_max_bytes": 10000000,
   "runs_log_path": "logs/runs.jsonl",
   "scale_exit_enabled": true,
   "scale_exit_fraction": 0.5,

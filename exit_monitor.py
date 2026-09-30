@@ -15,7 +15,6 @@ import argparse
 import json
 import os
 import sys
-from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -23,36 +22,17 @@ ROOT = Path(os.getenv("COINBASE_BOT_ROOT", Path(__file__).resolve().parent)).res
 sys.path.insert(0, str(ROOT))
 
 import coinbase_spot_bot as bot  # noqa: E402
+import exits  # noqa: E402
 
 CONFIG = ROOT / "config.json"
-
-
-def _round_money(x: float) -> float:
-    return round(float(x), 8)
 
 
 def _event(result: dict[str, Any]) -> str:
     return json.dumps(result, indent=2, sort_keys=True)
 
 
-def _set_product_cooldown(state: dict[str, Any], product_id: str, minutes: float) -> None:
-    if not product_id or minutes <= 0:
-        return
-    cooldowns = state.setdefault("product_cooldowns", {})
-    if isinstance(cooldowns, dict):
-        cooldowns[product_id] = (bot.utcnow() + timedelta(minutes=float(minutes))).isoformat()
-
-
-def _trailing_exit_reason(cfg: dict[str, Any], pos: dict[str, Any], current: float, entry: float) -> str | None:
-    return bot.trailing_exit_reason(cfg, pos, current, entry)
-
-
-def _structural_exit_reason(cfg: dict[str, Any], pos: dict[str, Any], current: float, entry: float) -> str | None:
-    return bot.structural_exit_reason(cfg, pos, current, entry)
-
-
 def run(*, live: bool = False, json_status: bool = False) -> dict[str, Any]:
-    cfg = bot.load_config(CONFIG)
+    cfg = bot.load_config(CONFIG, required=bot.config_check.EXIT_REQUIRED)
     bot.load_dotenv(cfg.get("env_file", ROOT / ".env"))
 
     state_path = Path(cfg["state_path"])
@@ -68,6 +48,11 @@ def run(*, live: bool = False, json_status: bool = False) -> dict[str, Any]:
         "env_present": bot.env_present(),
         "open_positions_count": len(positions),
     }
+    # Report config problems but keep managing exits: refusing to run here
+    # would leave open positions without their stop-loss.
+    config_report = bot.config_check.validate(cfg)
+    if config_report["errors"] or config_report["warnings"]:
+        result["config_check"] = config_report
 
     if not positions:
         return result
@@ -88,141 +73,16 @@ def run(*, live: bool = False, json_status: bool = False) -> dict[str, Any]:
     pending_orders = bot.normalize_pending_orders(state)
     result["pending_orders"] = pending_orders
     positions = bot.normalize_positions(state)
-    if pending_orders:
+    # Keep managing exits while limit orders are pending (see exits.manage_exits).
+
+    # The same exit engine the full bot uses; this monitor just runs it more often.
+    bot.exchange_stops.sync(bot, cfg, state, result, live=live)
+    positions = bot.normalize_positions(state)
+    if any(ev.get("event") == "EXCHANGE_STOP_FILLED" for ev in result.get("exchange_stop_events", [])):
+        result["decision"] = "EXCHANGE_STOP_FILLED"  # a manage_exits() exit below overrides this
+    fired = exits.manage_exits(bot, cfg, state, positions, balances, result, live=live, source="exit_monitor")
+    if not fired and result["decision"] == "HOLD_POSITIONS" and bot.normalize_pending_orders(state):
         result["decision"] = "PENDING_ORDER_OPEN"
-        bot.save_json(state_path, state)
-        bot.append_jsonl(Path(cfg["runs_log_path"]), result)
-        return result
-
-    updated_positions: list[dict[str, Any]] = []
-    context_cache: dict[str, Any] | None = None
-
-    for pos in positions:
-        product_id = str(pos.get("product_id"))
-        base, _, _quote = product_id.partition("-")
-        entry = bot.fnum(pos.get("entry_price"))
-        current = bot.fnum(bot.product_info(product_id).get("price")) if product_id else 0.0
-        pnl_pct = ((current - entry) / entry) if entry > 0 and current > 0 else 0.0
-        base_size = min(bot.fnum(pos.get("base_size_est")), balances.get(base, 0.0))
-
-        enriched = {
-            **pos,
-            "current_price": _round_money(current),
-            "pnl_pct": pnl_pct,
-            "take_profit_price": _round_money(entry * (1 + float(cfg["take_profit_pct"]))),
-            "stop_loss_price": _round_money(entry * (1 - float(cfg["stop_loss_pct"]))),
-            "soft_invalidation_price": _round_money(entry * (1 - float(cfg["soft_invalidation_pct"]))),
-            "available_base_balance": balances.get(base, 0.0),
-            "exit_base_size": base_size,
-        }
-
-        sell_reason = None
-        exit_base_size = base_size
-        scale_reason, scale_size = bot.scale_exit_plan(cfg, pos, current, entry, base_size)
-        if scale_reason:
-            sell_reason = scale_reason
-            exit_base_size = scale_size
-        elif pnl_pct >= float(cfg["take_profit_pct"]):
-            sell_reason = "TAKE_PROFIT"
-        elif pnl_pct <= -float(cfg["stop_loss_pct"]):
-            sell_reason = "STOP_LOSS"
-        else:
-            structural_reason = _structural_exit_reason(cfg, pos, current, entry)
-            if structural_reason:
-                sell_reason = structural_reason
-                try:
-                    if context_cache is None:
-                        context_cache = bot._load_context_cache(cfg)  # noqa: SLF001
-                    pos_signal = bot.apply_context_scores(cfg, bot.score_product(cfg, product_id), context_cache)
-                    bot._save_context_cache(cfg, context_cache)  # noqa: SLF001
-                    result["position_signal"] = pos_signal.__dict__
-                except Exception as exc:  # do not convert a soft check failure into a cron error
-                    result["position_signal_error"] = str(exc)[:300]
-
-        trailing_reason = _trailing_exit_reason(cfg, pos, current, entry)
-        if trailing_reason and not sell_reason:
-            sell_reason = trailing_reason
-        enriched["exit_base_size"] = exit_base_size
-
-        if sell_reason and exit_base_size > 0:
-            result["decision"] = "EXIT_SIGNAL"
-            result["open_position"] = enriched
-            use_limit = bot.should_use_maker_limit(cfg, "SELL", sell_reason)
-            limit_price = bot.maker_limit_price(cfg, product_id, "SELL", current) if use_limit else None
-            result["proposed_order"] = {
-                "product_id": product_id,
-                "side": "SELL",
-                "base_size": exit_base_size,
-                "reason": sell_reason,
-                "order_type": "LIMIT_POST_ONLY" if use_limit else "MARKET_IOC",
-                "limit_price": limit_price,
-            }
-            result["preview"] = bot.preview_limit(product_id, "SELL", limit_price, base_size=exit_base_size, post_only=bool(cfg.get("maker_limit_post_only", True))) if use_limit else bot.preview_market(product_id, "SELL", base_size=exit_base_size)
-            gate = bot.live_gates_open(cfg, live)
-            replacement: dict[str, Any] | None = pos
-            if gate:
-                result["decision"] = gate
-            else:
-                order = bot.place_limit(product_id, "SELL", limit_price, base_size=exit_base_size, post_only=bool(cfg.get("maker_limit_post_only", True))) if use_limit else bot.place_market(product_id, "SELL", base_size=exit_base_size)
-                result["order"] = order
-                scale_exit_reason = str(cfg.get("scale_exit_reason", "SCALE_TAKE_PROFIT"))
-                if order.get("success") is True:
-                    oid = bot.order_id_from_response(order)
-                    if use_limit:
-                        result["decision"] = "LIMIT_ORDER_PLACED"
-                        pending_position = dict(pos)
-                        if sell_reason == scale_exit_reason:
-                            pending_position["scale_exit_pending_order_id"] = oid
-                            replacement = pending_position
-                        state.setdefault("pending_orders", []).append({"order_id": oid, "product_id": product_id, "side": "SELL", "reason": sell_reason, "base_size": exit_base_size, "limit_price": limit_price, "placed_at": result["ts"], "position": pending_position, "order_type": "LIMIT_POST_ONLY", "source": "exit_monitor"})
-                    else:
-                        fill = bot.market_fill_details(oid)
-                        filled_size = bot.fnum(fill.get("filled_size")) or exit_base_size
-                        realized = bot.realized_pnl_quote(cfg, pos, filled_size, fill, current)
-                        bot.record_realized_pnl(state, realized, result["ts"])
-                        result["fill"] = fill
-                        result["realized_pnl_quote"] = realized
-                        if sell_reason == scale_exit_reason:
-                            result["decision"] = "PARTIAL_EXIT_SENT"
-                            replacement = bot.apply_partial_exit_fill(pos, filled_size, result["ts"])
-                        else:
-                            result["decision"] = "ORDER_SENT"
-                            state["cooldown_until"] = (bot.utcnow() + timedelta(minutes=float(cfg["cooldown_minutes_after_trade"]))).isoformat()
-                            if sell_reason in {"STOP_LOSS", "SOFT_INVALIDATION", "TRAILING_STOP", "BREAKEVEN_LOCK"}:
-                                _set_product_cooldown(state, product_id, float(cfg.get("per_product_cooldown_minutes_after_stop", 720)))
-                            else:
-                                _set_product_cooldown(state, product_id, float(cfg.get("per_product_cooldown_minutes_after_trade", 180)))
-                            replacement = None
-                        bot.append_jsonl(Path(cfg["trades_log_path"]), {
-                            "ts": result["ts"],
-                            "side": "SELL",
-                            "reason": sell_reason,
-                            "order": order,
-                            "position": pos,
-                            "base_size": filled_size,
-                            "source": "exit_monitor",
-                            "order_type": "MARKET_IOC",
-                            "fill": fill,
-                            "realized_pnl_quote": realized,
-                        })
-                else:
-                    result["decision"] = "ORDER_FAILED"
-                    bot.append_jsonl(Path(cfg["trades_log_path"]), {
-                        "ts": result["ts"],
-                        "side": "SELL",
-                        "reason": sell_reason,
-                        "order": order,
-                        "position": pos,
-                        "source": "exit_monitor",
-                        "failed": True,
-                    })
-            bot.persist_positions(state, bot.replace_position(positions, pos, replacement))
-            break
-
-        updated_positions.append(pos)
-        result.setdefault("checked_positions", []).append(enriched)
-    else:
-        bot.persist_positions(state, updated_positions)
 
     result["pending_orders"] = bot.normalize_pending_orders(state)
     state["last_exit_monitor_at"] = result["ts"]
@@ -230,7 +90,7 @@ def run(*, live: bool = False, json_status: bool = False) -> dict[str, Any]:
     if result["decision"] != "HOLD_POSITIONS" or json_status:
         state["last_exit_monitor_result"] = result
     bot.save_json(state_path, state)
-    bot.append_jsonl(Path(cfg["runs_log_path"]), result)
+    bot.append_run_log(cfg, result)
     return result
 
 
@@ -240,15 +100,26 @@ def main() -> int:
     ap.add_argument("--json", action="store_true", help="Print status even when no exit fires")
     args = ap.parse_args()
 
-    cfg = bot.load_config(CONFIG)
+    try:
+        cfg = bot.load_config(CONFIG, required=bot.config_check.EXIT_REQUIRED)
+    except Exception as exc:
+        bot.load_dotenv(ROOT / ".env")
+        bot.alerts.notify_error({"state_path": str(ROOT / "state" / "state.json")}, exc, source="exit_monitor")
+        raise
+    bot.load_dotenv(cfg.get("env_file", ROOT / ".env"))  # early, so a crash can still alert
     try:
         with bot.run_lock_for(cfg):
-            result = run(live=args.live, json_status=args.json)
+            try:
+                result = run(live=args.live, json_status=args.json)
+            except Exception as exc:
+                bot.alerts.notify_error(cfg, exc, source="exit_monitor")
+                raise
     except bot.RunLocked as exc:
         # Another run is managing positions right now; the next tick will retry.
         if args.json:
             print(_event({"ts": bot.utcnow().isoformat(), "monitor": "exit_only", "decision": "SKIPPED_RUN_LOCKED", "reason": str(exc)}))
         return 0
+    bot.alerts.notify_result(cfg, result, source="exit_monitor")
     # Quiet cron behavior: no output for ordinary holds/no positions. no_agent cron
     # sends nothing on empty stdout, but sends important exit/block/error events.
     if args.json or result.get("decision") not in {"HOLD_POSITIONS", "NO_POSITIONS"}:

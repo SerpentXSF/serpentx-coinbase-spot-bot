@@ -60,7 +60,7 @@ def main() -> int:
     ap.add_argument("--json", action="store_true", help="Print the snapshot")
     args = ap.parse_args()
 
-    cfg = bot.load_config(CONFIG)
+    cfg = bot.load_config(CONFIG, required={"trades_log_path"})
     bot.load_dotenv(cfg.get("env_file", ROOT / ".env"))
     env = bot.env_present()
     if not (env.get("COINBASE_API_KEY_NAME") and env.get("COINBASE_API_PRIVATE_KEY")):
