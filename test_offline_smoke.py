@@ -98,8 +98,11 @@ class OfflineSmokeTests(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp(prefix="cb-bot-smoke-"))
         self.root = self.tmp / "bot"
         self.root.mkdir()
-        for name in SCRIPTS:
-            shutil.copy(REPO / name, self.root / name)
+        # Copy every runtime module (not just the entry points) so shared
+        # modules such as indicators.py are importable, exactly like a clone.
+        for src in REPO.glob("*.py"):
+            if not src.name.startswith("test_"):
+                shutil.copy(src, self.root / src.name)
         shutil.copy(REPO / "config.example.json", self.root / "config.json")
         # Mirror the README quick start exactly: copy the template unchanged.
         shutil.copy(REPO / ".env.example", self.root / ".env")
