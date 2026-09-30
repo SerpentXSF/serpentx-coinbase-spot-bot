@@ -20,6 +20,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from urllib.parse import urlparse
+
 import requests
 
 ORDER_DECISIONS = {"ORDER_SENT", "PARTIAL_EXIT_SENT", "LIMIT_ORDER_PLACED", "ORDER_FAILED"}
@@ -96,17 +98,28 @@ def messages_for(result: dict[str, Any], *, source: str = "bot") -> list[tuple[s
     return [(key, f"[{source}] {text}") for key, text in out]
 
 
+def detect_format(url: str) -> str:
+    """Pick the payload format from the webhook's actual host, never a substring
+    match on the whole URL (which "https://x.test/?hooks.slack.com" would fool).
+    Self-hosted ntfy servers need ALERT_WEBHOOK_FORMAT=ntfy."""
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return "json"
+    host = (parsed.hostname or "").lower()
+    if host in {"discord.com", "discordapp.com", "ptb.discord.com", "canary.discord.com"} and parsed.path.startswith("/api/webhooks/"):
+        return "discord"
+    if host == "hooks.slack.com":
+        return "slack"
+    if host == "ntfy.sh":
+        return "ntfy"
+    return "json"
+
+
 def _payload(url: str, text: str) -> tuple[dict[str, Any] | None, str | None]:
     fmt = (os.getenv("ALERT_WEBHOOK_FORMAT") or "").lower()
     if not fmt:
-        if "discord.com/api/webhooks" in url or "discordapp.com/api/webhooks" in url:
-            fmt = "discord"
-        elif "hooks.slack.com" in url:
-            fmt = "slack"
-        elif "ntfy" in url:
-            fmt = "ntfy"
-        else:
-            fmt = "json"
+        fmt = detect_format(url)
     if fmt == "discord":
         return {"content": text[:1900]}, None
     if fmt == "slack":

@@ -118,3 +118,16 @@ class ReviewFixAlertTests(AlertTests):
             with self.assertRaisesRegex(RuntimeError, "not valid JSON"):
                 bot.main()
         self.assertIn("not valid JSON", self.post.call_args.kwargs["json"]["text"])
+
+
+class FormatDetectionTests(unittest.TestCase):
+    def test_detection_uses_the_real_host(self) -> None:
+        self.assertEqual(alerts.detect_format("https://discord.com/api/webhooks/1/abc"), "discord")
+        self.assertEqual(alerts.detect_format("https://hooks.slack.com/services/T/B/x"), "slack")
+        self.assertEqual(alerts.detect_format("https://ntfy.sh/my-topic"), "ntfy")
+        self.assertEqual(alerts.detect_format("https://example.test/hook"), "json")
+
+    def test_lookalike_urls_are_not_misdetected(self) -> None:
+        for url in ("https://evil.test/?u=hooks.slack.com", "https://hooks.slack.com.evil.test/x",
+                    "https://evil.test/discord.com/api/webhooks/1", "https://my-ntfy.example/topic"):
+            self.assertEqual(alerts.detect_format(url), "json", url)
