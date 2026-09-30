@@ -1961,8 +1961,6 @@ def run(cfg: dict[str, Any], *, status: bool=False, live: bool=False) -> dict[st
     if config_report["errors"] or config_report["warnings"]:
         result["config_check"] = config_report
 
-    if pending_orders and not status:
-        result["decision"] = "PENDING_ORDER_OPEN"
 
     if status and positions:
         enriched_positions = []
@@ -1983,14 +1981,21 @@ def run(cfg: dict[str, Any], *, status: bool=False, live: bool=False) -> dict[st
 
     # First priority: manage exits for existing bot-opened positions. Only one
     # live order is sent per run, so exits take precedence over new entries.
-    if positions and not status and result["decision"] != "PENDING_ORDER_OPEN":
+    # Exits are managed even while limit orders are pending: a resting maker
+    # order must never switch off stop-loss protection for open positions.
+    exit_fired = False
+    if positions and not status:
         exchange_stops.sync(sys.modules[__name__], cfg, state, result, live=live)
         positions = normalize_positions(state)
-    if positions and not status and result["decision"] != "PENDING_ORDER_OPEN":
-        if not exits.manage_exits(sys.modules[__name__], cfg, state, positions, balances, result, live=live, context_cache=context_cache):
+    if positions and not status:
+        exit_fired = exits.manage_exits(sys.modules[__name__], cfg, state, positions, balances, result, live=live, context_cache=context_cache)
+    if not exit_fired and not status:
+        if normalize_pending_orders(state):
+            # No new entries while an order is still working.
+            result["decision"] = "PENDING_ORDER_OPEN"
+        elif positions and len(positions) >= max_positions:
             # No exits; continue below only if another entry slot is available.
-            if len(positions) >= max_positions:
-                result["decision"] = "HOLD_POSITIONS"
+            result["decision"] = "HOLD_POSITIONS"
 
     if result["decision"] in {"SHADOW_ONLY", "HOLD_POSITIONS"} and status:
         result["decision"] = "STATUS_ONLY"

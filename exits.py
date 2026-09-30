@@ -53,6 +53,57 @@ def exit_reason(api: ModuleType, cfg: dict[str, Any], pos: dict[str, Any], curre
     return sell_reason, exit_base_size, structural
 
 
+def pending_sell_for(api: ModuleType, state: dict[str, Any], product_id: str) -> dict[str, Any] | None:
+    for row in api.normalize_pending_orders(state):
+        if row.get("product_id") == product_id and str(row.get("side", "")).upper() == "SELL":
+            return row
+    return None
+
+
+def cancel_pending_sell(api: ModuleType, cfg: dict[str, Any], state: dict[str, Any], pos: dict[str, Any],
+                        row: dict[str, Any], result: dict[str, Any]) -> tuple[str, dict[str, Any] | None]:
+    """Cancel a resting limit SELL so a stop-type exit can market-sell instead.
+
+    Returns ("cancelled", position) with any partial limit fill already booked
+    and the position reduced, or ("failed", reason). A limit that filled
+    completely is left for reconcile_pending_orders() on the next run.
+    """
+    fnum = api.fnum
+    oid = str(row["order_id"])
+    try:
+        ok = api.cancel_succeeded(api.cancel_order(oid), oid)
+    except Exception as exc:
+        ok, err = False, str(exc)[:200]
+    else:
+        err = "rejected"
+    try:
+        detail = api.fetch_order_detail(oid)
+    except Exception:
+        detail = {}
+    status = str(detail.get("status") or "").upper()
+    if not ok and status not in exchange_stops.DONE_STATUSES:
+        return "failed", f"could not cancel resting limit sell {oid}: {err}"
+    if status == "FILLED":
+        return "failed", f"resting limit sell {oid} already filled; booked on the next reconcile"
+    state["pending_orders"] = [r for r in api.normalize_pending_orders(state) if str(r.get("order_id")) != oid]
+    filled = fnum(detail.get("filled_size"))
+    updated: dict[str, Any] | None = dict(pos)
+    updated.pop("scale_exit_pending_order_id", None)
+    if filled > 0:
+        price = fnum(detail.get("average_filled_price")) or fnum(row.get("limit_price"))
+        fill = {"order_id": oid, "filled_size": filled, "average_filled_price": price, "total_fees": fnum(detail.get("total_fees"))}
+        realized = api.realized_pnl_quote(cfg, pos, filled, fill, price)
+        api.record_realized_pnl(state, realized, result["ts"])
+        api.append_jsonl(Path(cfg["trades_log_path"]), {
+            "ts": result["ts"], "side": "SELL", "reason": row.get("reason") or "LIMIT_EXIT_PARTIAL",
+            "order": {"success": True, "success_response": {"order_id": oid, "product_id": pos.get("product_id"), "side": "SELL"}},
+            "order_detail": detail, "position": pos, "base_size": filled, "realized_pnl_quote": realized, "source": "limit_cancelled_for_risk_exit",
+        })
+        updated = api.apply_partial_exit_fill(updated, filled, result["ts"])
+    result.setdefault("cancelled_pending_orders", []).append({"order_id": oid, "filled_before_cancel": filled})
+    return "cancelled", updated
+
+
 def manage_exits(
     api: ModuleType,
     cfg: dict[str, Any],
@@ -88,8 +139,10 @@ def manage_exits(
         base, _, _ = product_id.partition("-")
         entry = fnum(pos.get("entry_price"))
         current = fnum(api.product_info(product_id).get("price")) if product_id else 0.0
-        # Coins held by this position's own exchange stop are still ours to sell.
-        base_size = min(fnum(pos.get("base_size_est")), balances.get(base, 0.0) + exchange_stops.held_size(pos))
+        # Coins held by this position's own exchange stop or resting limit sell are still ours to sell.
+        pending_sell = pending_sell_for(api, state, product_id)
+        held_by_limit = fnum(pending_sell.get("base_size")) if pending_sell else 0.0
+        base_size = min(fnum(pos.get("base_size_est")), balances.get(base, 0.0) + exchange_stops.held_size(pos) + held_by_limit)
         pnl_pct = ((current - entry) / entry) if entry > 0 and current > 0 else 0.0
 
         sell_reason, exit_base_size, structural = exit_reason(api, cfg, pos, current, entry, base_size)
@@ -115,13 +168,18 @@ def manage_exits(
             "exit_base_size": exit_base_size,
         }
 
+        urgent_over_limit = bool(pending_sell and sell_reason in STOP_LIKE_REASONS)
+        if pending_sell and not urgent_over_limit:
+            # Its own resting limit sell is already exiting it; only a stop-type exit overrides that.
+            sell_reason = None
+            enriched["pending_sell_order_id"] = pending_sell.get("order_id")
         if not (sell_reason and exit_base_size > 0):
             held.append(pos)
             result.setdefault("checked_positions", []).append(enriched)
             continue
 
         result["open_position"] = enriched
-        use_limit = api.should_use_maker_limit(cfg, "SELL", sell_reason)
+        use_limit = False if urgent_over_limit else api.should_use_maker_limit(cfg, "SELL", sell_reason)
         limit_price = api.maker_limit_price(cfg, product_id, "SELL", current) if use_limit else None
         result["proposed_order"] = {
             "product_id": product_id,
@@ -137,6 +195,23 @@ def manage_exits(
         )
         replacement: dict[str, Any] | None = pos
         gate = api.live_gates_open(cfg, live)
+        if not gate and urgent_over_limit:
+            outcome, info = cancel_pending_sell(api, cfg, state, pos, pending_sell, result)
+            if outcome == "failed":
+                result["decision"] = "PENDING_CANCEL_FAILED"
+                result["pending_cancel_error"] = info
+                api.persist_positions(state, positions)
+                return True
+            if info is None:
+                # The limit filled almost everything before we cancelled it.
+                result["decision"] = "LIMIT_EXIT_FILLED_BEFORE_CANCEL"
+                api.persist_positions(state, api.replace_position(positions, pos, None))
+                return True
+            positions = api.replace_position(positions, pos, info)
+            pos = info
+            exit_base_size = min(exit_base_size, fnum(pos.get("base_size_est")))
+            result["proposed_order"]["base_size"] = exit_base_size
+            replacement = pos
         if not gate and exchange_stops.held_size(pos) > 0:
             # Free the coins held by the exchange backstop before selling them.
             outcome, info = exchange_stops.cancel_for_exit(api, cfg, state, pos, result)

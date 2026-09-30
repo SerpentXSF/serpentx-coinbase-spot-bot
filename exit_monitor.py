@@ -73,18 +73,16 @@ def run(*, live: bool = False, json_status: bool = False) -> dict[str, Any]:
     pending_orders = bot.normalize_pending_orders(state)
     result["pending_orders"] = pending_orders
     positions = bot.normalize_positions(state)
-    if pending_orders:
-        result["decision"] = "PENDING_ORDER_OPEN"
-        bot.save_json(state_path, state)
-        bot.append_run_log(cfg, result)
-        return result
+    # Keep managing exits while limit orders are pending (see exits.manage_exits).
 
     # The same exit engine the full bot uses; this monitor just runs it more often.
     bot.exchange_stops.sync(bot, cfg, state, result, live=live)
     positions = bot.normalize_positions(state)
     if any(ev.get("event") == "EXCHANGE_STOP_FILLED" for ev in result.get("exchange_stop_events", [])):
         result["decision"] = "EXCHANGE_STOP_FILLED"  # a manage_exits() exit below overrides this
-    exits.manage_exits(bot, cfg, state, positions, balances, result, live=live, source="exit_monitor")
+    fired = exits.manage_exits(bot, cfg, state, positions, balances, result, live=live, source="exit_monitor")
+    if not fired and result["decision"] == "HOLD_POSITIONS" and bot.normalize_pending_orders(state):
+        result["decision"] = "PENDING_ORDER_OPEN"
 
     result["pending_orders"] = bot.normalize_pending_orders(state)
     state["last_exit_monitor_at"] = result["ts"]
