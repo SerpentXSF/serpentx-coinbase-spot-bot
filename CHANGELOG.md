@@ -6,6 +6,14 @@
 - The bot's candle scoring moved into `technical_long_score()`, a function with no network calls, with no behaviour change (verified identical on 1,300 randomized markets). The scanner's duplicate EMA/RSI code now uses the bot's.
 - `logs/runs.jsonl` rotates at `runs_log_max_bytes` (default 10 MB) and keeps `runs_log_backups` files (default 5). `trades.jsonl` is never rotated.
 - The dashboard reads only the end of the runs log for the latest run. On a 153 MB log: 6.4 s down to under 1 ms.
+- **Fixed:** while any limit order was pending (a maker entry or a resting take-profit), the bot and exit monitor skipped exit management for every position for up to 90 minutes. Stops are now always managed; a stop-type exit cancels the position's own resting limit sell and market-sells.
+- **New:** optional Coinbase-held backstop stop-limit orders (`exchange_stop_enabled`, default off). Includes handling for Coinbase balance holds, cancel-before-exit, fills while offline, re-placement, and a preview check before every placement.
+- **New:** `strategy_backtest.py` replays history through the real entry rules and the shared exit engine, with fees and slippage and no lookahead.
+- **New:** `config.json` validation (`config_check.py`). Errors block new entries (`CONFIG_INVALID`) but never exits. A string `"active_trading": "false"` no longer counts as an open live gate. `rsi_divergence_enabled` is now honoured.
+- **New:** optional webhook alerts (`ALERT_WEBHOOK_URL`: Discord, Slack, ntfy, or JSON).
+- **New:** `rsi_method: "wilder"` option (default `"simple"` keeps current behaviour).
+- **Refactor:** `coinbase_spot_bot.py` split into `indicators.py` and `exits.py`, one exit engine shared by the bot and the exit monitor. Verified identical to the previous behaviour on 800 randomized exit scenarios.
+- **Perf:** one keep-alive HTTP session for Coinbase calls, a 5 s product-price cache, and clock-skew checks taken from existing responses (19 requests on 19 connections down to 17 on one, per preview run).
 - Fixed `rotate_and_run.py` / `analyze_usdc_pairs.py` and `candidate_forward_backtest.py` crashing on startup with `NameError: name 'os' is not defined`.
 - Fixed the README quick start failing with `Coinbase private key must be PEM text` when `.env` was copied from the template but not yet filled in; placeholder credentials now count as "no credentials" and the template ships blank.
 - Fixed the dashboard reading `state.json` / `trades.jsonl` from the repo root instead of the `state/` and `logs/` paths the bot writes, so positions, cooldowns, and trades now appear.
