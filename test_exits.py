@@ -22,8 +22,8 @@ class ExitReasonTests(unittest.TestCase):
         self.assertEqual(self.reason(1.10, scale=("SCALE_TAKE_PROFIT", 5.0)), ("SCALE_TAKE_PROFIT", 5.0, False))
 
     def test_take_profit_and_stop_loss_thresholds(self) -> None:
-        self.assertEqual(self.reason(1.065)[0], "TAKE_PROFIT")
-        self.assertEqual(self.reason(0.965)[0], "STOP_LOSS")
+        self.assertEqual(self.reason(1.0651)[0], "TAKE_PROFIT")  # just past 6.5%; exactly 1.065 is 0.0649999... in floats
+        self.assertEqual(self.reason(0.9649)[0], "STOP_LOSS")
         self.assertIsNone(self.reason(1.0)[0])
 
     def test_hard_stop_beats_structural_and_structural_is_flagged(self) -> None:
