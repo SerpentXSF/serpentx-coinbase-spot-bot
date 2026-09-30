@@ -48,6 +48,11 @@ def run(*, live: bool = False, json_status: bool = False) -> dict[str, Any]:
         "env_present": bot.env_present(),
         "open_positions_count": len(positions),
     }
+    # Report config problems but keep managing exits: refusing to run here
+    # would leave open positions without their stop-loss.
+    config_report = bot.config_check.validate(cfg)
+    if config_report["errors"] or config_report["warnings"]:
+        result["config_check"] = config_report
 
     if not positions:
         return result

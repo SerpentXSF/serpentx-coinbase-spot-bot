@@ -52,6 +52,7 @@ from indicators import (  # noqa: E402,F401  (re-exported: other scripts use bot
     rsi,
     rsi_divergence,
 )
+import config_check  # noqa: E402
 import exits  # noqa: E402
 
 BASE_HOST = "api.coinbase.com"
@@ -97,7 +98,14 @@ def load_config(path: str | Path) -> dict[str, Any]:
     p = Path(path)
     if not p.exists():
         raise RuntimeError(f"Config not found: {p}. Create it with: cp config.example.json config.json")
-    return resolve_runtime_paths(load_json(p))
+    try:
+        raw = load_json(p)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"{p} is not valid JSON: {exc}") from exc
+    missing = [e for e in config_check.validate(raw)["errors"] if e.startswith("missing required key")]
+    if missing:
+        raise RuntimeError(f"{p}: " + "; ".join(missing) + ". Compare with config.example.json or run: python config_check.py")
+    return resolve_runtime_paths(raw)
 
 
 def save_json(path: Path, data: dict[str, Any]) -> None:
@@ -971,12 +979,15 @@ def technical_long_score(cfg: dict[str, Any], exec_c: list[dict[str, Any]], tren
     trend20 = ema(trend_closes[-80:], 20)
     trend50 = ema(trend_closes[-120:], 50)
     cur_rsi = rsi(closes, 14)
-    divergence = rsi_divergence(
-        exec_c,
-        period=int(cfg.get("rsi_divergence_period", 14)),
-        swing_window=int(cfg.get("rsi_divergence_swing_window", 2)),
-        lookback=int(cfg.get("rsi_divergence_lookback_candles", 80)),
-    )
+    if cfg.get("rsi_divergence_enabled", True):
+        divergence = rsi_divergence(
+            exec_c,
+            period=int(cfg.get("rsi_divergence_period", 14)),
+            swing_window=int(cfg.get("rsi_divergence_swing_window", 2)),
+            lookback=int(cfg.get("rsi_divergence_lookback_candles", 80)),
+        )
+    else:
+        divergence = {"label": "None", "signal": "none", "disabled": True}
     score = 0
     reasons: list[str] = []
 
@@ -1436,7 +1447,8 @@ def dynamic_quote_size(cfg: dict[str, Any], quote_bal: float, top: Signal) -> fl
 def live_gates_open(cfg: dict[str, Any], live: bool) -> str | None:
     if not live:
         return "PREVIEW_ONLY"
-    if not cfg.get("active_trading"):
+    # Require a real JSON true: a string such as "false" is truthy in Python.
+    if cfg.get("active_trading") is not True:
         return "LIVE_BLOCKED_CONFIG_ACTIVE_TRADING_FALSE"
     if os.getenv("COINBASE_TRADING_ENABLED") != "1":
         return "LIVE_BLOCKED_ENV_TRADING_DISABLED"
@@ -1846,9 +1858,13 @@ def run(cfg: dict[str, Any], *, status: bool=False, live: bool=False) -> dict[st
     max_positions = int(cfg.get("max_open_positions", 1))
     result["daily_trades_used"] = daily_trades
     result["daily_realized_pnl"] = state.get("daily_realized_pnl")
-    result["live_gates"] = {"--live": bool(live), "config_active_trading": bool(cfg.get("active_trading")), "env_COINBASE_TRADING_ENABLED": os.getenv("COINBASE_TRADING_ENABLED") == "1"}
+    result["live_gates"] = {"--live": bool(live), "config_active_trading": cfg.get("active_trading") is True, "env_COINBASE_TRADING_ENABLED": os.getenv("COINBASE_TRADING_ENABLED") == "1"}
     result["open_positions"] = positions
     result["pending_orders"] = pending_orders
+
+    config_report = config_check.validate(cfg)
+    if config_report["errors"] or config_report["warnings"]:
+        result["config_check"] = config_report
 
     if pending_orders and not status:
         result["decision"] = "PENDING_ORDER_OPEN"
@@ -1885,6 +1901,9 @@ def run(cfg: dict[str, Any], *, status: bool=False, live: bool=False) -> dict[st
         entry_signal = choose_entry_signal(cfg, signals, positions, state)
         if not balances:
             result["decision"] = "NEEDS_CREDENTIALS_FOR_PREVIEW_OR_TRADE"
+        elif config_report["errors"]:
+            # A broken risk setting must not open new positions; exits above still ran.
+            result["decision"] = "CONFIG_INVALID"
         elif in_cooldown:
             result["decision"] = "COOLDOWN"
             result["cooldown_until"] = cooldown_until
@@ -1972,6 +1991,9 @@ def summarize(result: dict[str, Any]) -> str:
         parts.append("Balances checked: " + ", ".join(f"{k}={v:.6g}" for k, v in sorted(result["balances"].items())))
     if "auth_status" in result:
         parts.append(f"Auth: {result['auth_status']}")
+    for level in ("errors", "warnings"):
+        for msg in (result.get("config_check") or {}).get(level, []):
+            parts.append(f"Config {level[:-1]}: {msg}")
     gates = result.get("live_gates") or {}
     if gates:
         parts.append("Live gates: " + ", ".join(f"{k}={'open' if v else 'closed'}" for k, v in gates.items()))
@@ -1991,7 +2013,7 @@ def main() -> None:
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
     cfg = load_config(args.config)
-    if args.live and not args.status and cfg.get("active_trading"):
+    if args.live and not args.status and cfg.get("active_trading") is True:
         load_dotenv(cfg.get("env_file", ROOT / ".env"))
         if os.getenv("COINBASE_TRADING_ENABLED") == "1":
             print("*** LIVE TRADING ENABLED: all three gates are open; real orders may be placed ***", file=sys.stderr)
