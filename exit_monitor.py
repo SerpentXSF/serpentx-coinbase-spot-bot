@@ -32,7 +32,7 @@ def _event(result: dict[str, Any]) -> str:
 
 
 def run(*, live: bool = False, json_status: bool = False) -> dict[str, Any]:
-    cfg = bot.load_config(CONFIG)
+    cfg = bot.load_config(CONFIG, required=bot.config_check.EXIT_REQUIRED)
     bot.load_dotenv(cfg.get("env_file", ROOT / ".env"))
 
     state_path = Path(cfg["state_path"])
@@ -100,7 +100,12 @@ def main() -> int:
     ap.add_argument("--json", action="store_true", help="Print status even when no exit fires")
     args = ap.parse_args()
 
-    cfg = bot.load_config(CONFIG)
+    try:
+        cfg = bot.load_config(CONFIG, required=bot.config_check.EXIT_REQUIRED)
+    except Exception as exc:
+        bot.load_dotenv(ROOT / ".env")
+        bot.alerts.notify_error({"state_path": str(ROOT / "state" / "state.json")}, exc, source="exit_monitor")
+        raise
     bot.load_dotenv(cfg.get("env_file", ROOT / ".env"))  # early, so a crash can still alert
     try:
         with bot.run_lock_for(cfg):

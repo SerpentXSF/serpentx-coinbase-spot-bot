@@ -99,29 +99,45 @@ def _cache_dir() -> Path:
     return ROOT / "analysis" / "backtest_cache"
 
 
+def _fetch_range(product_id: str, granularity: str, start: int, end: int) -> list[dict[str, Any]]:
+    data = bot.public_get(
+        f"/api/v3/brokerage/market/products/{product_id}/candles",
+        {"start": start, "end": end, "granularity": granularity},
+    )
+    time.sleep(0.12)  # stay well under public rate limits
+    return data.get("candles", [])
+
+
 def fetch_history(product_id: str, granularity: str, start: int, end: int) -> list[dict[str, Any]]:
-    """Public Coinbase candles for [start, end), paginated and cached on disk."""
+    """Public Coinbase candles for [start, end).
+
+    History is fetched in fixed, epoch-aligned chunks of MAX_CANDLES_PER_REQUEST
+    candles (one request each). Chunks that ended in the past never change, so
+    they are cached on disk and reused by every later run; only the chunk still
+    in progress is re-fetched.
+    """
     gran = GRAN_SECONDS[granularity]
-    start, end = start - start % gran, end - end % gran
-    cache = _cache_dir() / f"{product_id}_{granularity}_{start}_{end}.json"
-    if cache.exists():
-        return json.loads(cache.read_text())
+    chunk = MAX_CANDLES_PER_REQUEST * gran
+    now = int(time.time())
     out: dict[int, dict[str, Any]] = {}
-    cursor = start
+    cursor = start - start % chunk
     while cursor < end:
-        chunk_end = min(end, cursor + MAX_CANDLES_PER_REQUEST * gran)
-        data = bot.public_get(
-            f"/api/v3/brokerage/market/products/{product_id}/candles",
-            {"start": cursor, "end": chunk_end, "granularity": granularity},
-        )
-        for c in data.get("candles", []):
-            out[int(c["start"])] = c
+        chunk_end = cursor + chunk
+        complete = chunk_end <= now - gran
+        cache = _cache_dir() / f"{product_id}_{granularity}_{cursor}.json"
+        if complete and cache.exists():
+            rows = json.loads(cache.read_text())
+        else:
+            rows = _fetch_range(product_id, granularity, cursor, min(chunk_end, now))
+            if complete:
+                cache.parent.mkdir(parents=True, exist_ok=True)
+                cache.write_text(json.dumps(rows))
+        for c in rows:
+            ts = int(c["start"])
+            if start <= ts < end:
+                out[ts] = c
         cursor = chunk_end
-        time.sleep(0.12)  # stay well under public rate limits
-    rows = [out[k] for k in sorted(out)]
-    cache.parent.mkdir(parents=True, exist_ok=True)
-    cache.write_text(json.dumps(rows))
-    return rows
+    return [out[k] for k in sorted(out)]
 
 
 def needed_granularities(cfg: dict[str, Any]) -> dict[str, int]:
@@ -280,13 +296,10 @@ class Simulation:
     def entry_step(self) -> None:
         cfg, state = self.cfg, self.state
         signals = [bot.safe_score_product(cfg, p) for p in self.products]
-        for s in signals:
-            if s.action == "ERROR":
-                continue
-            s.final_score = s.score
-            if self.context == "neutral" and not s.risk_block:
-                # All providers neutral: final == technical score, judged against the final threshold.
-                s.action = "BUY" if s.final_score >= int(cfg.get("final_score_threshold", cfg["score_threshold"])) else "HOLD_USDC"
+        # The bot's real context step, with every provider neutral in "neutral" mode
+        # (so the overheated penalty and final threshold apply exactly as live).
+        ctx_cfg = {**cfg, "external_context_enabled": self.context == "neutral"}
+        signals = [s if s.action == "ERROR" else bot.apply_context_scores(ctx_cfg, s, {}) for s in signals]
         signals.sort(key=lambda s: (s.final_score or s.score, s.score, s.change_24h, s.quote_volume), reverse=True)
         positions = bot.normalize_positions(state)
         now = bot.utcnow()
@@ -334,7 +347,9 @@ class Simulation:
     def run(self, start: int, end: int) -> None:
         cadence = int(float(self.cfg.get("entry_rotator_cadence_minutes", 90)) * 60)
         clock = lambda: datetime.fromtimestamp(self.market.now, tz=timezone.utc)  # noqa: E731
-        with patched(bot, fetch_candles=self.market.fetch_candles, product_info=self.market.product_info, utcnow=clock):
+        neutral = lambda *a, **k: {"score": 0, "reasons": ["historical context unavailable"], "risk_block": False}  # noqa: E731
+        with patched(bot, fetch_candles=self.market.fetch_candles, product_info=self.market.product_info, utcnow=clock,
+                     fetch_news_context=neutral, fetch_market_context=neutral, social_context=neutral, whale_context=neutral):
             t = start - start % STEP_SECONDS
             next_entry = t
             while t < end:

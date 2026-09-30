@@ -66,6 +66,13 @@ OPTIONAL = {
 }
 KNOWN = REQUIRED | OPTIONAL
 
+# The subset the exit monitor needs. It must still run (and protect open
+# positions) when a key used only for entries is missing.
+EXIT_REQUIRED = {
+    "take_profit_pct", "stop_loss_pct", "soft_invalidation_pct", "cooldown_minutes_after_trade",
+    "state_path", "runs_log_path", "trades_log_path",
+}
+
 # Fractions of price or balance: 0.035 means 3.5%. Values >= 1 are almost
 # certainly percentages typed as whole numbers.
 FRACTION_KEYS = {

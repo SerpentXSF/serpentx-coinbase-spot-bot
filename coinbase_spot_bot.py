@@ -16,6 +16,7 @@ import os
 import re
 import secrets
 import sys
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -98,7 +99,13 @@ def resolve_runtime_paths(cfg: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
-def load_config(path: str | Path) -> dict[str, Any]:
+def load_config(path: str | Path, required: set[str] | None = None) -> dict[str, Any]:
+    """Load config.json, failing fast if a key this caller needs is missing.
+
+    ``required`` defaults to every key the full bot reads; the exit monitor
+    passes the smaller set it uses so a missing entry-only key never stops
+    stop-loss management.
+    """
     p = Path(path)
     if not p.exists():
         raise RuntimeError(f"Config not found: {p}. Create it with: cp config.example.json config.json")
@@ -106,7 +113,8 @@ def load_config(path: str | Path) -> dict[str, Any]:
         raw = load_json(p)
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"{p} is not valid JSON: {exc}") from exc
-    missing = [e for e in config_check.validate(raw)["errors"] if e.startswith("missing required key")]
+    needed = config_check.REQUIRED if required is None else required
+    missing = [f"missing required key '{k}'" for k in sorted(needed - set(raw))]
     if missing:
         raise RuntimeError(f"{p}: " + "; ".join(missing) + ". Compare with config.example.json or run: python config_check.py")
     return resolve_runtime_paths(raw)
@@ -268,20 +276,21 @@ def env_present() -> dict[str, bool]:
     }
 
 
-_HTTP: requests.Session | None = None
+_HTTP_LOCAL = threading.local()
 
 
 def http() -> requests.Session:
-    """One keep-alive session for all Coinbase calls in this process.
+    """A keep-alive session for Coinbase calls, one per thread.
 
     A run makes ~20 Coinbase requests; reusing one TLS connection instead of
-    opening a new one per call saves a handshake each time. The bot is
-    single-threaded; the threaded scanner keeps its own per-thread sessions.
+    opening a new one per call saves a handshake each time. Sessions are
+    per-thread because requests.Session is not thread-safe and the dashboard
+    serves requests from several threads.
     """
-    global _HTTP
-    if _HTTP is None:
-        _HTTP = requests.Session()
-    return _HTTP
+    session = getattr(_HTTP_LOCAL, "session", None)
+    if session is None:
+        session = _HTTP_LOCAL.session = requests.Session()
+    return session
 
 
 def _note_server_date(r: Any) -> None:
@@ -1041,6 +1050,7 @@ def technical_long_score(cfg: dict[str, Any], exec_c: list[dict[str, Any]], tren
             period=int(cfg.get("rsi_divergence_period", 14)),
             swing_window=int(cfg.get("rsi_divergence_swing_window", 2)),
             lookback=int(cfg.get("rsi_divergence_lookback_candles", 80)),
+            method=str(cfg.get("rsi_method", "simple")),
         )
     else:
         divergence = {"label": "None", "signal": "none", "disabled": True}
@@ -2002,6 +2012,12 @@ def run(cfg: dict[str, Any], *, status: bool=False, live: bool=False) -> dict[st
     if result["decision"] in {"SHADOW_ONLY", "HOLD_POSITIONS"} and status:
         result["decision"] = "STATUS_ONLY"
     elif result["decision"] == "SHADOW_ONLY":
+        # Re-read after exits: a backstop fill booked by exchange_stops.sync()
+        # this run sets a cooldown and counts as a trade.
+        cooldown_until = state.get("cooldown_until")
+        in_cooldown = cooldown_until and cooldown_until > utcnow().isoformat()
+        daily_trades = count_daily_trades(Path(cfg["trades_log_path"]))
+        result["daily_trades_used"] = daily_trades
         positions = normalize_positions(state)
         entry_signal = choose_entry_signal(cfg, signals, positions, state)
         if not balances:
@@ -2118,7 +2134,13 @@ def main() -> None:
     ap.add_argument("--live", action="store_true", help="Attempt live order if all gates allow it")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
-    cfg = load_config(args.config)
+    try:
+        cfg = load_config(args.config)
+    except Exception as exc:
+        # A broken config.json stops every run: that deserves an alert too.
+        load_dotenv(ROOT / ".env")
+        alerts.notify_error({"state_path": str(ROOT / "state" / "state.json")}, exc, source="bot")
+        raise
     load_dotenv(cfg.get("env_file", ROOT / ".env"))  # early, so a crash can still alert
     if args.live and not args.status and cfg.get("active_trading") is True:
         if os.getenv("COINBASE_TRADING_ENABLED") == "1":

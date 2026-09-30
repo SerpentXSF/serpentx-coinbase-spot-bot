@@ -89,3 +89,23 @@ class BotReactionTests(RunHarness):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ExitMonitorConfigTests(RunHarness):
+    def test_exit_monitor_still_protects_when_an_entry_only_key_is_missing(self) -> None:
+        import exit_monitor
+
+        cfg = {k: v for k, v in self.cfg.items() if k != "lookback_trend_hours"}
+        (self.tmp / "config.json").write_text(json.dumps(cfg))
+        self.write_state({"open_positions": self.two_positions()})
+        self.prices["POS1-USDC"] = 0.9
+        with patch.object(exit_monitor, "CONFIG", self.tmp / "config.json"):
+            result = exit_monitor.run(live=False)
+        self.assertEqual(result["decision"], "PREVIEW_ONLY")  # exit logic ran
+        self.assertIn("missing required key 'lookback_trend_hours'", result["config_check"]["errors"])
+
+    def test_exit_monitor_fails_fast_only_on_keys_it_uses(self) -> None:
+        path = self.tmp / "config.json"
+        path.write_text(json.dumps({k: v for k, v in self.cfg.items() if k != "stop_loss_pct"}))
+        with self.assertRaisesRegex(RuntimeError, "stop_loss_pct"):
+            bot.load_config(path, required=config_check.EXIT_REQUIRED)

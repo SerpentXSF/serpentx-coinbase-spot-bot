@@ -215,3 +215,77 @@ if __name__ == "__main__":
     import unittest
 
     unittest.main()
+
+
+class PartialFillReviewTests(StopHarness):
+    def test_partial_stop_fill_before_cancel_is_booked_and_only_the_rest_is_sold(self) -> None:
+        self.balances["POS1"] = 0.0
+        self.write_state({"open_positions": [self.position(stop_oid="stop-9")]})
+        self.prices["POS1-USDC"] = 1.2  # take-profit fires while the stop had partly filled
+        self.order_details["oid-1"] = {"status": "FILLED", "filled_size": "6", "average_filled_price": "1.2", "filled_value": "7.2", "total_fees": "0.09"}
+        original = self.stops.cancel
+
+        def partial_then_cancel(oid):
+            resp = original(oid)
+            self.order_details[oid] = {"status": "CANCELLED", "filled_size": "4", "average_filled_price": "0.945", "total_fees": "0.05"}
+            return resp
+
+        with patch.object(bot, "cancel_order", side_effect=partial_then_cancel):
+            result = bot.run(self.cfg, live=True)
+        self.assertEqual(self.placed, [("POS1-USDC", "SELL", None, 6.0)])
+        self.assertEqual(result["decision"], "ORDER_SENT")
+        reasons = [t["reason"] for t in self.trades()]
+        self.assertEqual(reasons, ["EXCHANGE_STOP", "TAKE_PROFIT"])
+        self.assertEqual(self.read_state()["open_positions"], [])
+
+    def test_unconfirmable_fills_after_cancel_mean_no_sell_and_stop_record_kept(self) -> None:
+        self.write_state({"open_positions": [self.position(stop_oid="stop-9")]})
+        self.prices["POS1-USDC"] = 1.2
+        calls = {"n": 0}
+
+        def detail(oid):
+            calls["n"] += 1
+            if oid == "stop-9" and calls["n"] > 1:  # sync() check passes, the post-cancel check fails
+                raise RuntimeError("503")
+            return self.order_details.get(oid, {})
+
+        with patch.object(bot, "fetch_order_detail", side_effect=detail):
+            result = bot.run(self.cfg, live=True)
+        self.assertEqual(result["decision"], "EXCHANGE_STOP_CANCEL_FAILED")
+        self.assertEqual(self.placed, [])
+        self.assertEqual(self.read_state()["open_positions"][0]["exchange_stop"]["order_id"], "stop-9")
+
+
+class OvernightStopEntryTests(StopHarness):
+    def test_backstop_fill_found_at_run_start_blocks_an_immediate_re_entry(self) -> None:
+        self.write_state({"open_positions": [self.position(stop_oid="stop-9")]})
+        self.order_details["stop-9"] = {"status": "FILLED", "filled_size": "10", "average_filled_price": "0.945", "total_fees": "0.11"}
+        with patch.object(bot, "choose_entry_signal", return_value=signal("AAA-USDC", 2.0, "BUY", 9)):
+            result = bot.run(self.cfg, live=True)
+        self.assertEqual(result["decision"], "COOLDOWN")
+        self.assertEqual(self.placed, [])
+
+
+class SyncRobustnessTests(StopHarness):
+    def test_price_lookup_failure_for_one_position_does_not_skip_exits(self) -> None:
+        # POS2 has no backstop yet and its ticker lookup fails; POS1 must still stop out.
+        self.write_state({"open_positions": [self.position(stop_oid="stop-9"), self.position("POS2-USDC")]})
+        self.prices["POS1-USDC"] = 0.9
+        real = bot.product_info
+
+        def flaky(pid):
+            if pid == "POS2-USDC" and not flaky.exits_started:
+                raise RuntimeError("503 from Coinbase")
+            return real(pid)
+
+        flaky.exits_started = False
+        original_manage = bot.exits.manage_exits
+
+        def manage(*a, **k):
+            flaky.exits_started = True
+            return original_manage(*a, **k)
+
+        with patch.object(bot, "product_info", side_effect=flaky), patch.object(bot.exits, "manage_exits", side_effect=manage):
+            result = bot.run(self.cfg, live=True)
+        self.assertEqual(result["decision"], "ORDER_SENT")
+        self.assertIn("price lookup failed", self.read_state()["open_positions"][0]["exchange_stop_error"])

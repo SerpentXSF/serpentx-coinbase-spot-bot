@@ -38,3 +38,14 @@ class RsiMethodTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class DivergenceMethodTests(unittest.TestCase):
+    def test_divergence_uses_the_configured_rsi_method(self) -> None:
+        candles = [{"start": str(i), "close": c} for i, c in enumerate(CLOSES * 3)]
+        simple = indicators.rsi_divergence(candles, period=14, swing_window=1, lookback=80)
+        wilder = indicators.rsi_divergence(candles, period=14, swing_window=1, lookback=80, method="wilder")
+        self.assertEqual(indicators._rsi_series(CLOSES, 14, "wilder")[-1], indicators.rsi_wilder(CLOSES))
+        self.assertEqual(indicators._rsi_series(CLOSES, 14)[-1], indicators.rsi(CLOSES))
+        if simple.get("latest_rsi") is not None and wilder.get("latest_rsi") is not None:
+            self.assertNotEqual(simple["latest_rsi"], wilder["latest_rsi"])

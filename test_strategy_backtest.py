@@ -105,3 +105,46 @@ class BacktestTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ContextModeTests(unittest.TestCase):
+    def test_neutral_context_applies_the_live_overheated_penalty(self) -> None:
+        # Up 25% in 24h, technical score exactly at the final threshold: live holds it (-1 penalty).
+        sig = bot.Signal("HOT-USDC", 1.0, int(CFG["final_score_threshold"]), "BUY", [], 50.0, 25.0, 1e7)
+        market = make_market({"HOT-USDC": trending_path(1, 400, 0.0, 0.001)})
+        sim = sb.Simulation(CFG, market, ["HOT-USDC"], start_balance=100, fee_per_side=0.012, slippage=0.0)
+        market.now = T0 + 300 * 300
+        neutral = lambda *a, **k: {"score": 0, "reasons": [], "risk_block": False}  # noqa: E731
+        with sb.patched(bot, safe_score_product=lambda cfg, p: sig, fetch_news_context=neutral, fetch_market_context=neutral,
+                        social_context=neutral, whale_context=neutral, utcnow=lambda: sb.datetime.fromtimestamp(market.now, tz=sb.timezone.utc)):
+            sim.entry_step()
+        self.assertEqual(sim.buys, [])
+        self.assertEqual(sig.context_score, -1)
+
+
+class CacheTests(unittest.TestCase):
+    def test_completed_chunks_are_reused_across_runs_with_different_end_times(self) -> None:
+        import shutil
+        import tempfile
+        from unittest.mock import patch
+
+        tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        calls = []
+
+        def fake_get(path, params):
+            calls.append(params["start"])
+            g = sb.GRAN_SECONDS[params["granularity"]]
+            return {"candles": [{"start": str(t), "close": 1} for t in range(params["start"], params["end"], g)]}
+
+        now = 1_790_000_000
+        with patch.object(sb, "_cache_dir", lambda: tmp), patch.object(bot, "public_get", side_effect=fake_get), \
+                patch.object(sb.time, "sleep", lambda *_: None), patch.object(sb.time, "time", lambda: now):
+            first = sb.fetch_history("A-USDC", "FIVE_MINUTE", now - 3 * 86400, now)
+            n_first = len(calls)
+            later = now + 600  # ten minutes later, different end time
+            with patch.object(sb.time, "time", lambda: later):
+                second = sb.fetch_history("A-USDC", "FIVE_MINUTE", later - 3 * 86400, later)
+        self.assertEqual(len(calls) - n_first, 1)  # only the in-progress chunk is re-fetched
+        self.assertEqual(len(first), 3 * 288)
+        self.assertEqual(int(second[-1]["start"]), later - later % 300)  # newest candle is included

@@ -100,3 +100,21 @@ class AlertTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReviewFixAlertTests(AlertTests):
+    def test_blocked_stop_exit_behind_a_resting_limit_alerts(self) -> None:
+        result = {"decision": "PENDING_CANCEL_FAILED", "proposed_order": {"product_id": "SOL-USDC"}, "pending_cancel_error": "could not cancel L1"}
+        [(_, text)] = alerts.messages_for(result)
+        self.assertIn("SOL-USDC", text)
+        self.assertIn("could not cancel", text)
+
+    def test_broken_config_json_alerts_before_failing(self) -> None:
+        cfg_path = self.tmp / "config.json"
+        cfg_path.write_text('{"active_trading": false,}')  # trailing comma
+        with self.env("https://example.test/hook"), \
+                patch.object(sys, "argv", ["coinbase_spot_bot.py", "--config", str(cfg_path)]), \
+                patch.object(bot, "ROOT", self.tmp):
+            with self.assertRaisesRegex(RuntimeError, "not valid JSON"):
+                bot.main()
+        self.assertIn("not valid JSON", self.post.call_args.kwargs["json"]["text"])

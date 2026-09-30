@@ -54,3 +54,14 @@ class HttpEfficiencyTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ThreadSafetyTests(unittest.TestCase):
+    def test_each_thread_gets_its_own_session(self) -> None:
+        import threading
+
+        seen = []
+        t = threading.Thread(target=lambda: seen.append(bot.http()))
+        t.start()
+        t.join()
+        self.assertIsNot(seen[0], bot.http())

@@ -217,13 +217,20 @@ def manage_exits(
             outcome, info = exchange_stops.cancel_for_exit(api, cfg, state, pos, result)
             if outcome == "filled":
                 result["decision"] = "EXCHANGE_STOP_FILLED"
-                api.persist_positions(state, api.replace_position(positions, pos, info))
+                api.persist_positions(state, api.replace_position(positions, pos, None))
                 return True
             if outcome == "failed":
                 result["decision"] = "EXCHANGE_STOP_CANCEL_FAILED"
                 result["exchange_stop_error"] = info
                 api.persist_positions(state, positions)
                 return True
+            if info is not pos:
+                # Part of the stop filled before the cancel landed: sell only what is left.
+                positions = api.replace_position(positions, pos, info)
+                pos = info
+                exit_base_size = min(exit_base_size, fnum(pos.get("base_size_est")))
+                result["proposed_order"]["base_size"] = exit_base_size
+                replacement = pos
         if gate:
             result["decision"] = gate
         else:

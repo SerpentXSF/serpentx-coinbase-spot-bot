@@ -69,13 +69,14 @@ def rsi_for(cfg: dict[str, Any], vals: list[float], period: int = 14) -> float:
     return rsi_wilder(vals, period) if str(cfg.get("rsi_method", "simple")).lower() == "wilder" else rsi(vals, period)
 
 
-def _rsi_series(vals: list[float], period: int = 14) -> list[float | None]:
-    """Return simple rolling RSI values aligned to vals, using no paid APIs."""
+def _rsi_series(vals: list[float], period: int = 14, method: str = "simple") -> list[float | None]:
+    """Return rolling RSI values aligned to vals ("simple" or "wilder", as rsi_for)."""
+    fn = rsi_wilder if str(method).lower() == "wilder" else rsi
     out: list[float | None] = [None] * len(vals)
     if len(vals) < period + 1:
         return out
     for i in range(period, len(vals)):
-        out[i] = rsi(vals[: i + 1], period)
+        out[i] = fn(vals[: i + 1], period)
     return out
 
 
@@ -95,7 +96,7 @@ def _swing_points(values: list[float], *, mode: str, window: int) -> list[int]:
     return idxs
 
 
-def rsi_divergence(candles: list[dict[str, Any]], period: int = 14, swing_window: int = 2, lookback: int = 80) -> dict[str, Any]:
+def rsi_divergence(candles: list[dict[str, Any]], period: int = 14, swing_window: int = 2, lookback: int = 80, method: str = "simple") -> dict[str, Any]:
     """Detect classic RSI divergence from local candle closes.
 
     Bullish Divergence: price makes a lower swing low while RSI makes a higher low.
@@ -117,7 +118,7 @@ def rsi_divergence(candles: list[dict[str, Any]], period: int = 14, swing_window
     }
     if len(closes) < max(period + 3, swing_window * 2 + 3):
         return neutral
-    rsis = _rsi_series(closes, period)
+    rsis = _rsi_series(closes, period, method)
 
     def pair_payload(signal: str, label: str, a: int, b: int) -> dict[str, Any]:
         return {

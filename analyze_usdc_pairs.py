@@ -103,7 +103,7 @@ def score_product(p):
     e9=ema(closes[-80:],9); e21=ema(closes[-100:],21); e50=ema(closes[-140:],50)
     t50=ema(tcloses[-140:],50); t20=ema(tcloses[-80:],20)
     rrsi=bot.rsi_for(CFG, closes)
-    div=bot.rsi_divergence(exec_c, period=14, swing_window=2, lookback=80)
+    div=bot.rsi_divergence(exec_c, period=14, swing_window=2, lookback=80, method=CFG.get('rsi_method', 'simple'))
     div_signal=div.get('signal','none')
     div_label=div.get('label','None')
     # Volatility: average high-low pct over the last 20 exec candles.

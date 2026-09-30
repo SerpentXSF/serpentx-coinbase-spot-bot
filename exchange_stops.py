@@ -67,7 +67,12 @@ def place(api: ModuleType, cfg: dict[str, Any], pos: dict[str, Any], result: dic
     if entry <= 0 or size <= 0:
         return False
     stop, limit = stop_prices(cfg, entry)
-    current = api.fnum(api.product_info(product_id).get("price"))
+    try:
+        current = api.fnum(api.product_info(product_id).get("price"))
+    except Exception as exc:
+        pos["exchange_stop_error"] = f"price lookup failed: {str(exc)[:200]}"
+        _event(result, "EXCHANGE_STOP_PLACE_FAILED", pos, error=pos["exchange_stop_error"])
+        return False
     if 0 < current <= stop:
         # Already through the backstop level: the bot's own stop handles it now.
         _event(result, "EXCHANGE_STOP_SKIPPED_PRICE_BELOW_STOP", pos, stop_price=stop, current_price=current)
@@ -135,65 +140,86 @@ def sync(api: ModuleType, cfg: dict[str, Any], state: dict[str, Any], result: di
     positions = api.normalize_positions(state)
     updated: list[dict[str, Any]] = []
     for pos in positions:
-        stop = pos.get("exchange_stop") or {}
-        if stop.get("order_id"):
-            try:
-                detail = api.fetch_order_detail(str(stop["order_id"]))
-            except Exception as exc:
-                pos["exchange_stop_error"] = f"status check failed: {str(exc)[:200]}"
+        try:
+            _sync_one(api, cfg, state, pos, result, updated, live=live)
+        except Exception as exc:  # one position's problem must never skip exit management
+            pos["exchange_stop_error"] = f"sync failed: {str(exc)[:200]}"
+            _event(result, "EXCHANGE_STOP_PLACE_FAILED", pos, error=pos["exchange_stop_error"])
+            if not any(p is pos for p in updated):
                 updated.append(pos)
-                continue
-            status = str(detail.get("status") or "").upper()
-            if api.fnum(detail.get("filled_size")) > 0 and (status in DONE_STATUSES):
-                remaining = record_stop_fill(api, cfg, state, pos, detail, result)
-                if remaining:
-                    place(api, cfg, remaining, result, live=live)
-                    updated.append(remaining)
-                continue
-            if status in DONE_STATUSES:
-                pos.pop("exchange_stop", None)
-                _event(result, "EXCHANGE_STOP_MISSING", pos, status=status)
-            else:
-                updated.append(pos)
-                continue
-        if not api.pending_order_active(state, str(pos.get("product_id")), "SELL"):
-            # A resting limit SELL already holds these coins; re-place once it resolves.
-            place(api, cfg, pos, result, live=live)
-        updated.append(pos)
     api.persist_positions(state, updated)
+
+
+def _sync_one(api: ModuleType, cfg: dict[str, Any], state: dict[str, Any], pos: dict[str, Any],
+              result: dict[str, Any], updated: list[dict[str, Any]], *, live: bool) -> None:
+    stop = pos.get("exchange_stop") or {}
+    if stop.get("order_id"):
+        try:
+            detail = api.fetch_order_detail(str(stop["order_id"]))
+        except Exception as exc:
+            pos["exchange_stop_error"] = f"status check failed: {str(exc)[:200]}"
+            updated.append(pos)
+            return
+        status = str(detail.get("status") or "").upper()
+        if api.fnum(detail.get("filled_size")) > 0 and (status in DONE_STATUSES):
+            remaining = record_stop_fill(api, cfg, state, pos, detail, result)
+            if remaining:
+                place(api, cfg, remaining, result, live=live)
+                updated.append(remaining)
+            return
+        if status in DONE_STATUSES:
+            pos.pop("exchange_stop", None)
+            _event(result, "EXCHANGE_STOP_MISSING", pos, status=status)
+        else:
+            updated.append(pos)
+            return
+    if not api.pending_order_active(state, str(pos.get("product_id")), "SELL"):
+        # A resting limit SELL already holds these coins; re-place once it resolves.
+        place(api, cfg, pos, result, live=live)
+    updated.append(pos)
 
 
 def cancel_for_exit(api: ModuleType, cfg: dict[str, Any], state: dict[str, Any], pos: dict[str, Any], result: dict[str, Any]) -> tuple[str, Any]:
     """Free the coins held by ``pos``'s backstop so the bot can sell them.
 
+    The stop's fill status is always checked, even after a successful cancel:
+    a stop-limit can partially fill before the cancel lands.
+
     Returns one of:
-      ("none", None)        no backstop to cancel
-      ("cancelled", None)   cancelled; its coins are free to sell
-      ("filled", remaining) it filled before we could cancel; the exit already
-                            happened on the exchange (remaining position or None)
-      ("failed", reason)    could not cancel and it has not filled; do not sell
+      ("none", pos)        no backstop to cancel
+      ("cancelled", pos2)  the backstop is gone; pos2 is the position after any
+                           partial stop fill was booked (sell pos2's size)
+      ("filled", None)     it filled (fully) before we could cancel; the exit
+                           already happened on the exchange
+      ("failed", reason)   could not cancel, or could not confirm its fills;
+                           do not sell this run
     """
     stop = pos.get("exchange_stop") or {}
     oid = stop.get("order_id")
     if not oid:
-        return "none", None
-    cancel_error = ""
+        return "none", pos
+    cancelled, cancel_error = False, ""
     try:
-        if api.cancel_succeeded(api.cancel_order(str(oid)), str(oid)):
-            pos.pop("exchange_stop", None)
-            _event(result, "EXCHANGE_STOP_CANCELLED_FOR_EXIT", pos, order_id=oid)
-            return "cancelled", None
+        cancelled = api.cancel_succeeded(api.cancel_order(str(oid)), str(oid))
     except Exception as exc:
         cancel_error = str(exc)[:200]
-    # Cancel refused: find out why before doing anything else.
     try:
         detail = api.fetch_order_detail(str(oid))
     except Exception as exc:
-        return "failed", f"cancel failed ({cancel_error}) and status check failed: {str(exc)[:160]}"
+        # Keep the stop record either way: the next sync() reads its final
+        # status and books any fill, instead of us guessing now.
+        state_note = "cancelled" if cancelled else f"cancel failed ({cancel_error or 'rejected'})"
+        return "failed", f"{state_note}; could not confirm stop fills: {str(exc)[:160]}"
     status = str(detail.get("status") or "").upper()
-    if api.fnum(detail.get("filled_size")) > 0 and status in DONE_STATUSES:
-        return "filled", record_stop_fill(api, cfg, state, pos, detail, result)
-    if status in DONE_STATUSES:
-        pos.pop("exchange_stop", None)
-        return "cancelled", None
-    return "failed", f"cancel failed ({cancel_error or 'rejected'}); stop still {status or 'unknown'}"
+    done = cancelled or status in DONE_STATUSES
+    if not done:
+        return "failed", f"cancel failed ({cancel_error or 'rejected'}); stop still {status or 'unknown'}"
+    if api.fnum(detail.get("filled_size")) > 0:
+        remaining = record_stop_fill(api, cfg, state, pos, detail, result)
+        if remaining is None:
+            return "filled", None
+        _event(result, "EXCHANGE_STOP_CANCELLED_FOR_EXIT", pos, order_id=oid, filled_before_cancel=api.fnum(detail.get("filled_size")))
+        return "cancelled", remaining
+    pos.pop("exchange_stop", None)
+    _event(result, "EXCHANGE_STOP_CANCELLED_FOR_EXIT", pos, order_id=oid)
+    return "cancelled", pos

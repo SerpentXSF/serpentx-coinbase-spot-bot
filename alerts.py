@@ -68,6 +68,9 @@ def messages_for(result: dict[str, Any], *, source: str = "bot") -> list[tuple[s
         info = result.get("daily_loss_limit") or {}
         out.append((f"cond:loss:{info.get('date')}", f"Daily loss limit reached: realized {_fmt_num(info.get('realized_quote'))} "
                      f"vs limit {_fmt_num(info.get('limit_quote'))}. New entries paused until 00:00 UTC; exits continue."))
+    if decision == "PENDING_CANCEL_FAILED":
+        out.append((f"cond:pendingcancel:{product}", f"Stop-type exit for {product} is blocked: could not cancel its resting limit sell; "
+                     f"nothing sold this run: {str(result.get('pending_cancel_error'))[:300]}"))
     if decision == "EXCHANGE_STOP_CANCEL_FAILED":
         out.append((f"cond:stopcancel:{product}", f"Could not cancel the exchange stop for {product} before exiting; "
                      f"exit skipped this run: {str(result.get('exchange_stop_error'))[:300]}"))
