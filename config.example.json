@@ -1,5 +1,6 @@
 {
   "active_trading": false,
+  "alert_repeat_minutes": 360,
   "allowed_products": [
     "BTC-USDC",
     "ETH-USDC",

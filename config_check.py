@@ -35,7 +35,7 @@ REQUIRED = {
 # Optional keys read with cfg.get(...), plus documentation-only keys shipped in
 # config.example.json. Anything else is reported as unknown.
 OPTIONAL = {
-    "base_url", "breakeven_activation_pct", "breakeven_lock_enabled", "breakeven_lock_pct",
+    "alert_repeat_minutes", "base_url", "breakeven_activation_pct", "breakeven_lock_enabled", "breakeven_lock_pct",
     "candidate_backtest_cadence_minutes", "context_cache_path", "context_overheated_24h_pct",
     "daily_max_loss_pct", "daily_max_trades", "directional_strategy", "entry_rotator_cadence_minutes",
     "entry_trigger_mode", "env_file", "estimated_roundtrip_fee_pct", "execution_mode",
@@ -80,7 +80,7 @@ NON_NEGATIVE_NUMBER_KEYS = {
     "cooldown_minutes_after_trade", "per_product_cooldown_minutes_after_stop",
     "per_product_cooldown_minutes_after_trade", "maker_limit_pending_timeout_minutes",
     "rotator_analyzer_timeout_seconds", "rotator_bot_timeout_seconds", "run_lock_stale_seconds",
-    "runs_log_max_bytes", "runs_log_backups", "score_threshold", "final_score_threshold",
+    "runs_log_max_bytes", "runs_log_backups", "score_threshold", "final_score_threshold", "alert_repeat_minutes",
 }
 BOOL_KEYS = {
     "active_trading", "external_context_enabled", "fee_aware_entry_enabled", "five_minute_confirmation_enabled",

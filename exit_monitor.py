@@ -99,14 +99,20 @@ def main() -> int:
     args = ap.parse_args()
 
     cfg = bot.load_config(CONFIG)
+    bot.load_dotenv(cfg.get("env_file", ROOT / ".env"))  # early, so a crash can still alert
     try:
         with bot.run_lock_for(cfg):
-            result = run(live=args.live, json_status=args.json)
+            try:
+                result = run(live=args.live, json_status=args.json)
+            except Exception as exc:
+                bot.alerts.notify_error(cfg, exc, source="exit_monitor")
+                raise
     except bot.RunLocked as exc:
         # Another run is managing positions right now; the next tick will retry.
         if args.json:
             print(_event({"ts": bot.utcnow().isoformat(), "monitor": "exit_only", "decision": "SKIPPED_RUN_LOCKED", "reason": str(exc)}))
         return 0
+    bot.alerts.notify_result(cfg, result, source="exit_monitor")
     # Quiet cron behavior: no output for ordinary holds/no positions. no_agent cron
     # sends nothing on empty stdout, but sends important exit/block/error events.
     if args.json or result.get("decision") not in {"HOLD_POSITIONS", "NO_POSITIONS"}:

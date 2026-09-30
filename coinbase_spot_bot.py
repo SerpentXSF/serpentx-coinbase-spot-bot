@@ -52,6 +52,7 @@ from indicators import (  # noqa: E402,F401  (re-exported: other scripts use bot
     rsi,
     rsi_divergence,
 )
+import alerts  # noqa: E402
 import config_check  # noqa: E402
 import exits  # noqa: E402
 
@@ -2013,17 +2014,22 @@ def main() -> None:
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
     cfg = load_config(args.config)
+    load_dotenv(cfg.get("env_file", ROOT / ".env"))  # early, so a crash can still alert
     if args.live and not args.status and cfg.get("active_trading") is True:
-        load_dotenv(cfg.get("env_file", ROOT / ".env"))
         if os.getenv("COINBASE_TRADING_ENABLED") == "1":
             print("*** LIVE TRADING ENABLED: all three gates are open; real orders may be placed ***", file=sys.stderr)
     try:
         with run_lock_for(cfg):
-            result = run(cfg, status=args.status, live=args.live)
+            try:
+                result = run(cfg, status=args.status, live=args.live)
+            except Exception as exc:
+                alerts.notify_error(cfg, exc, source="bot")
+                raise
     except RunLocked as exc:
         skipped = {"ts": utcnow().isoformat(), "decision": "SKIPPED_RUN_LOCKED", "reason": str(exc)}
         print(json.dumps(skipped, indent=2, sort_keys=True) if args.json else f"Skipped: {exc}")
         return
+    alerts.notify_result(cfg, result, source="bot")
     print(json.dumps(result, indent=2, sort_keys=True) if args.json else summarize(result))
 
 
