@@ -300,7 +300,7 @@ Set `ALERT_WEBHOOK_URL` in `.env` to get a push message for:
 - the daily loss limit pausing entries, an invalid `config.json`, and Coinbase backstop fills or failures
 - a bot or exit-monitor run crashing
 
-Paste a Discord or Slack incoming-webhook URL, or an [ntfy](https://ntfy.sh) topic URL such as `https://ntfy.sh/your-secret-topic` (free phone push; use a hard-to-guess topic name). The format is detected from the URL, or set `ALERT_WEBHOOK_FORMAT` (`discord`, `slack`, `ntfy`, `json`). Preview runs never alert. Conditions that repeat every run are sent at most once per `alert_repeat_minutes` (default 360). A failing webhook never affects trading.
+Paste a Discord or Slack incoming-webhook URL, or an [ntfy](https://ntfy.sh) topic URL such as `https://ntfy.sh/your-secret-topic` (free phone push; use a hard-to-guess topic name). The format is detected from the host (`discord.com`, `hooks.slack.com`, `ntfy.sh`); for anything else, including a self-hosted ntfy server, set `ALERT_WEBHOOK_FORMAT` (`discord`, `slack`, `ntfy`, `json`). Preview runs never alert. Conditions that repeat every run are sent at most once per `alert_repeat_minutes` (default 360). A failing webhook never affects trading.
 
 ### Coinbase-held backstop stops
 
