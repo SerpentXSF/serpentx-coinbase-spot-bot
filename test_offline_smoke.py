@@ -90,6 +90,8 @@ def fake_request(method, url, **kw):
 
 requests.get = fake_get
 requests.request = fake_request
+# The bot reuses a requests.Session; route its calls through the same fake.
+requests.Session.request = lambda self, method, url, **kw: fake_request(method, url, **kw)
 '''
 
 

@@ -265,11 +265,46 @@ def env_present() -> dict[str, bool]:
     }
 
 
+_HTTP: requests.Session | None = None
+
+
+def http() -> requests.Session:
+    """One keep-alive session for all Coinbase calls in this process.
+
+    A run makes ~20 Coinbase requests; reusing one TLS connection instead of
+    opening a new one per call saves a handshake each time. The bot is
+    single-threaded; the threaded scanner keeps its own per-thread sessions.
+    """
+    global _HTTP
+    if _HTTP is None:
+        _HTTP = requests.Session()
+    return _HTTP
+
+
+def _note_server_date(r: Any) -> None:
+    """Refresh the JWT clock-skew offset from any Coinbase response's Date header.
+
+    Every response carries one, so coinbase_epoch_now() rarely needs its own
+    request. Same rule as before: ignore skew under 30s.
+    """
+    try:
+        server_date = r.headers.get("Date")
+        if not server_date:
+            return
+        now = time.time()
+        offset = parsedate_to_datetime(server_date).timestamp() - now
+        _COINBASE_TIME_OFFSET["value"] = offset if abs(offset) > 30 else 0.0
+        _COINBASE_TIME_OFFSET["checked_at"] = now
+    except Exception:
+        pass
+
+
 def public_get(path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
     last_status = None
     last_data: dict[str, Any] = {}
     for attempt in range(4):
-        r = requests.get(BASE_URL + path, params=params, timeout=30)
+        r = http().get(BASE_URL + path, params=params, timeout=30)
+        _note_server_date(r)
         try:
             data = r.json()
         except Exception:
@@ -323,7 +358,7 @@ def coinbase_epoch_now() -> int:
     if now - float(_COINBASE_TIME_OFFSET.get("checked_at") or 0) < 300:
         return int(now + float(_COINBASE_TIME_OFFSET.get("value") or 0))
     try:
-        r = requests.get(BASE_URL + "/api/v3/brokerage/market/products/BTC-USDC", timeout=10)
+        r = http().get(BASE_URL + "/api/v3/brokerage/market/products/BTC-USDC", timeout=10)
         server_date = r.headers.get("Date")
         if server_date:
             server_dt = parsedate_to_datetime(server_date)
@@ -356,7 +391,7 @@ def build_jwt(method: str, path: str) -> str:
 def private_request(method: str, path: str, body: dict[str, Any] | None = None, params: dict[str, Any] | None = None) -> dict[str, Any]:
     method = method.upper()
     token = build_jwt(method, path)
-    r = requests.request(
+    r = http().request(
         method,
         BASE_URL + path,
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
@@ -364,6 +399,7 @@ def private_request(method: str, path: str, body: dict[str, Any] | None = None, 
         params=params,
         timeout=30,
     )
+    _note_server_date(r)
     try:
         data = r.json()
     except Exception:
@@ -385,8 +421,24 @@ def fetch_candles(product_id: str, granularity: str, lookback_hours: int) -> lis
     return candles
 
 
+PRODUCT_INFO_TTL_SECONDS = 5.0
+_PRODUCT_INFO_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+
+
 def product_info(product_id: str) -> dict[str, Any]:
-    return public_get(f"/api/v3/brokerage/market/products/{product_id}")
+    """Ticker/product info, cached for a few seconds.
+
+    Within one run the same product is often looked up twice (scored as a
+    candidate, then priced for its exit check); a 5 s cache removes the repeat
+    without letting a stale price reach a later run.
+    """
+    hit = _PRODUCT_INFO_CACHE.get(product_id)
+    now = time.monotonic()
+    if hit and now - hit[0] < PRODUCT_INFO_TTL_SECONDS:
+        return hit[1]
+    data = public_get(f"/api/v3/brokerage/market/products/{product_id}")
+    _PRODUCT_INFO_CACHE[product_id] = (now, data)
+    return data
 
 
 def product_metadata(product_id: str, ttl_seconds: int = 86400) -> dict[str, Any]:

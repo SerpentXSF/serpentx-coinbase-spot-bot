@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-import json, os, time, math
+import json, os, threading, time, math
 from datetime import datetime, timezone
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -34,10 +34,22 @@ LOOKBACK_TREND_H = int(CFG.get('lookback_trend_hours', 48))
 EXEC_L = GRAN_LABEL.get(BAR_EXEC, BAR_EXEC)
 TREND_L = GRAN_LABEL.get(BAR_TREND, BAR_TREND)
 
+_local = threading.local()
+
+
+def _session():
+    # One keep-alive session per worker thread: ~100 candle calls reuse 6
+    # connections instead of opening 100 (requests.Session is not thread-safe).
+    s = getattr(_local, 'session', None)
+    if s is None:
+        s = _local.session = requests.Session()
+    return s
+
+
 def get(path, params=None):
     last=None
     for attempt in range(2):
-        r=requests.get(BASE+path, params=params, timeout=6)
+        r=_session().get(BASE+path, params=params, timeout=6)
         if r.status_code<400:
             return r.json()
         last=r
