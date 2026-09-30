@@ -54,7 +54,7 @@ OPTIONAL = {
     "prevent_same_asset_duplicate", "product_metadata_cache_path", "provider_budget_path",
     "provider_cooldown_seconds", "provider_min_interval_seconds", "rotation_last_generated_at",
     "rotation_source", "rotator_analyzer_timeout_seconds", "rotator_bot_timeout_seconds",
-    "rsi_bearish_divergence_penalty", "rsi_bullish_divergence_score", "rsi_divergence_enabled",
+    "rsi_bearish_divergence_penalty", "rsi_method", "rsi_bullish_divergence_score", "rsi_divergence_enabled",
     "rsi_divergence_lookback_candles", "rsi_divergence_period", "rsi_divergence_swing_window",
     "run_lock_stale_seconds", "runs_log_backups", "runs_log_max_bytes", "scale_exit_enabled",
     "scale_exit_fraction", "scale_exit_reason", "scale_exit_take_profit_pct",
@@ -123,6 +123,8 @@ def validate(cfg: dict[str, Any]) -> dict[str, list[str]]:
         if not _is_number(v) or v < 0:
             errors.append(f"'{key}' must be a number >= 0, got {v!r}")
 
+    if "rsi_method" in cfg and str(cfg["rsi_method"]).lower() not in {"simple", "wilder"}:
+        errors.append(f"'rsi_method' is {cfg['rsi_method']!r}; expected 'simple' or 'wilder'")
     for key in ("bar_exec", "bar_trend"):
         if key in cfg and cfg[key] not in GRANULARITIES:
             errors.append(f"'{key}' is {cfg[key]!r}; expected one of {', '.join(sorted(GRANULARITIES))}")

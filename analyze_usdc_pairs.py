@@ -102,7 +102,7 @@ def score_product(p):
         return {**base(p), 'score':0, 'long_score':0, 'short_score':0, 'directional_bias':'NONE', 'action':'SKIP', 'reasons':['insufficient candle history'], 'short_reasons':[], 'cautions':cautions}
     e9=ema(closes[-80:],9); e21=ema(closes[-100:],21); e50=ema(closes[-140:],50)
     t50=ema(tcloses[-140:],50); t20=ema(tcloses[-80:],20)
-    rrsi=rsi(closes)
+    rrsi=bot.rsi_for(CFG, closes)
     div=bot.rsi_divergence(exec_c, period=14, swing_window=2, lookback=80)
     div_signal=div.get('signal','none')
     div_label=div.get('label','None')

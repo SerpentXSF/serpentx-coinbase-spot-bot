@@ -43,6 +43,32 @@ def rsi(vals: list[float], period: int = 14) -> float:
     return 100 - (100 / (1 + rs))
 
 
+def rsi_wilder(vals: list[float], period: int = 14) -> float:
+    """Wilder's smoothed RSI -- the version charting sites (e.g. TradingView) show.
+
+    Seeds with the simple average of the first ``period`` changes, then
+    smooths: avg = (prev_avg * (period - 1) + change) / period.
+    """
+    if len(vals) < period + 1:
+        return 50.0
+    changes = [b - a for a, b in zip(vals[:-1], vals[1:])]
+    avg_gain = sum(max(c, 0.0) for c in changes[:period]) / period
+    avg_loss = sum(max(-c, 0.0) for c in changes[:period]) / period
+    for c in changes[period:]:
+        avg_gain = (avg_gain * (period - 1) + max(c, 0.0)) / period
+        avg_loss = (avg_loss * (period - 1) + max(-c, 0.0)) / period
+    if avg_loss == 0:
+        return 100.0
+    return 100 - (100 / (1 + avg_gain / avg_loss))
+
+
+def rsi_for(cfg: dict[str, Any], vals: list[float], period: int = 14) -> float:
+    """RSI using the configured ``rsi_method``: "simple" (default, the bot's
+    historical behaviour: plain average of the last ``period`` changes) or
+    "wilder" (smoothed, matches charting sites)."""
+    return rsi_wilder(vals, period) if str(cfg.get("rsi_method", "simple")).lower() == "wilder" else rsi(vals, period)
+
+
 def _rsi_series(vals: list[float], period: int = 14) -> list[float | None]:
     """Return simple rolling RSI values aligned to vals, using no paid APIs."""
     out: list[float | None] = [None] * len(vals)

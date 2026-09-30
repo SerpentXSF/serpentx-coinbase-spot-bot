@@ -154,6 +154,7 @@
   "rsi_divergence_lookback_candles": 80,
   "rsi_divergence_period": 14,
   "rsi_divergence_swing_window": 2,
+  "rsi_method": "simple",
   "run_lock_stale_seconds": 900,
   "runs_log_backups": 5,
   "runs_log_max_bytes": 10000000,

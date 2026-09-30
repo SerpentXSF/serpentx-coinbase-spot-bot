@@ -51,6 +51,8 @@ from indicators import (  # noqa: E402,F401  (re-exported: other scripts use bot
     fnum,
     rsi,
     rsi_divergence,
+    rsi_for,
+    rsi_wilder,
 )
 import alerts  # noqa: E402
 import config_check  # noqa: E402
@@ -1032,7 +1034,7 @@ def technical_long_score(cfg: dict[str, Any], exec_c: list[dict[str, Any]], tren
     ema50 = ema(closes[-120:], 50)
     trend20 = ema(trend_closes[-80:], 20)
     trend50 = ema(trend_closes[-120:], 50)
-    cur_rsi = rsi(closes, 14)
+    cur_rsi = rsi_for(cfg, closes, 14)
     if cfg.get("rsi_divergence_enabled", True):
         divergence = rsi_divergence(
             exec_c,
