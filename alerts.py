@@ -23,6 +23,7 @@ from typing import Any
 import requests
 
 ORDER_DECISIONS = {"ORDER_SENT", "PARTIAL_EXIT_SENT", "LIMIT_ORDER_PLACED", "ORDER_FAILED"}
+STOP_EVENTS = {"EXCHANGE_STOP_FILLED", "EXCHANGE_STOP_PLACE_FAILED", "EXCHANGE_STOP_MISSING"}
 CONDITION_DECISIONS = {"DAILY_LOSS_LIMIT_REACHED", "CONFIG_INVALID"}
 PENDING_ALERTS = {
     "PENDING_BUY_FILLED_POSITION_OPENED", "PENDING_SELL_FILLED_POSITION_CLOSED",
@@ -67,6 +68,15 @@ def messages_for(result: dict[str, Any], *, source: str = "bot") -> list[tuple[s
         info = result.get("daily_loss_limit") or {}
         out.append((f"cond:loss:{info.get('date')}", f"Daily loss limit reached: realized {_fmt_num(info.get('realized_quote'))} "
                      f"vs limit {_fmt_num(info.get('limit_quote'))}. New entries paused until 00:00 UTC; exits continue."))
+    if decision == "EXCHANGE_STOP_CANCEL_FAILED":
+        out.append((f"cond:stopcancel:{product}", f"Could not cancel the exchange stop for {product} before exiting; "
+                     f"exit skipped this run: {str(result.get('exchange_stop_error'))[:300]}"))
+    for ev in result.get("exchange_stop_events") or []:
+        kind = ev.get("event")
+        if kind in STOP_EVENTS:
+            detail = ", ".join(f"{k} {_fmt_num(v) if isinstance(v, (int, float)) else v}" for k, v in ev.items() if k not in {"event", "product_id"})
+            key = f"stop:{kind}:{ev.get('product_id')}:{ev.get('average_filled_price') or ev.get('error') or ev.get('status')}"
+            out.append((key, f"{kind}: {ev.get('product_id')} {detail}"[:600]))
     if decision == "CONFIG_INVALID":
         errs = (result.get("config_check") or {}).get("errors", [])
         out.append(("cond:config", "config.json is invalid, new entries blocked: " + "; ".join(errs)[:500]))

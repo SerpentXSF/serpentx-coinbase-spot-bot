@@ -210,6 +210,7 @@ class Simulation:
         self.cfg = dict(cfg)
         # Model every order as a taker market fill (conservative).
         self.cfg["maker_limit_enabled"] = False
+        self.cfg["exchange_stop_enabled"] = False  # the bot's own exits are what we measure
         self.cfg.setdefault("fee_tracking", {})
         self.cfg["fee_tracking"] = {**self.cfg["fee_tracking"], "observed_taker_fee_pct_per_side": fee_per_side}
         self.market = market

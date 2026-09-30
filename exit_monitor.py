@@ -80,6 +80,10 @@ def run(*, live: bool = False, json_status: bool = False) -> dict[str, Any]:
         return result
 
     # The same exit engine the full bot uses; this monitor just runs it more often.
+    bot.exchange_stops.sync(bot, cfg, state, result, live=live)
+    positions = bot.normalize_positions(state)
+    if any(ev.get("event") == "EXCHANGE_STOP_FILLED" for ev in result.get("exchange_stop_events", [])):
+        result["decision"] = "EXCHANGE_STOP_FILLED"  # a manage_exits() exit below overrides this
     exits.manage_exits(bot, cfg, state, positions, balances, result, live=live, source="exit_monitor")
 
     result["pending_orders"] = bot.normalize_pending_orders(state)

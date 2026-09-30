@@ -39,6 +39,7 @@ OPTIONAL = {
     "candidate_backtest_cadence_minutes", "context_cache_path", "context_overheated_24h_pct",
     "daily_max_loss_pct", "daily_max_trades", "directional_strategy", "entry_rotator_cadence_minutes",
     "entry_trigger_mode", "env_file", "estimated_roundtrip_fee_pct", "execution_mode",
+    "exchange_stop_buffer_pct", "exchange_stop_enabled", "exchange_stop_limit_offset_pct",
     "exit_monitor_cadence_minutes", "expected_move_range_multiplier", "external_context_enabled",
     "fee_aware_entry_enabled", "fee_tracking", "final_score_threshold", "five_minute_confirmation_enabled",
     "five_minute_confirmation_lookback_hours", "five_minute_confirmation_min_candles",
@@ -72,7 +73,7 @@ FRACTION_KEYS = {
     "max_account_quote_pct_per_trade", "trailing_activation_pct", "trailing_drawdown_pct",
     "breakeven_activation_pct", "breakeven_lock_pct", "scale_exit_take_profit_pct", "scale_exit_fraction",
     "maker_limit_price_offset_pct", "minimum_net_edge_pct", "min_avg_exec_range_pct",
-    "estimated_roundtrip_fee_pct",
+    "estimated_roundtrip_fee_pct", "exchange_stop_buffer_pct", "exchange_stop_limit_offset_pct",
 }
 POSITIVE_INT_KEYS = {"max_open_positions", "daily_max_trades", "lookback_exec_hours", "lookback_trend_hours"}
 NON_NEGATIVE_NUMBER_KEYS = {
@@ -86,7 +87,7 @@ BOOL_KEYS = {
     "active_trading", "external_context_enabled", "fee_aware_entry_enabled", "five_minute_confirmation_enabled",
     "maker_limit_enabled", "maker_limit_post_only", "scale_exit_enabled", "trailing_stop_enabled",
     "breakeven_lock_enabled", "prevent_same_asset_duplicate", "rsi_divergence_enabled",
-    "thirty_minute_regime_gate_enabled",
+    "thirty_minute_regime_gate_enabled", "exchange_stop_enabled",
 }
 
 

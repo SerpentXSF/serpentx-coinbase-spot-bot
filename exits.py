@@ -18,6 +18,8 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
+import exchange_stops
+
 STOP_LIKE_REASONS = {"STOP_LOSS", "SOFT_INVALIDATION", "TRAILING_STOP", "BREAKEVEN_LOCK"}
 
 
@@ -86,7 +88,8 @@ def manage_exits(
         base, _, _ = product_id.partition("-")
         entry = fnum(pos.get("entry_price"))
         current = fnum(api.product_info(product_id).get("price")) if product_id else 0.0
-        base_size = min(fnum(pos.get("base_size_est")), balances.get(base, 0.0))
+        # Coins held by this position's own exchange stop are still ours to sell.
+        base_size = min(fnum(pos.get("base_size_est")), balances.get(base, 0.0) + exchange_stops.held_size(pos))
         pnl_pct = ((current - entry) / entry) if entry > 0 and current > 0 else 0.0
 
         sell_reason, exit_base_size, structural = exit_reason(api, cfg, pos, current, entry, base_size)
@@ -134,6 +137,18 @@ def manage_exits(
         )
         replacement: dict[str, Any] | None = pos
         gate = api.live_gates_open(cfg, live)
+        if not gate and exchange_stops.held_size(pos) > 0:
+            # Free the coins held by the exchange backstop before selling them.
+            outcome, info = exchange_stops.cancel_for_exit(api, cfg, state, pos, result)
+            if outcome == "filled":
+                result["decision"] = "EXCHANGE_STOP_FILLED"
+                api.persist_positions(state, api.replace_position(positions, pos, info))
+                return True
+            if outcome == "failed":
+                result["decision"] = "EXCHANGE_STOP_CANCEL_FAILED"
+                result["exchange_stop_error"] = info
+                api.persist_positions(state, positions)
+                return True
         if gate:
             result["decision"] = gate
         else:
@@ -166,6 +181,9 @@ def manage_exits(
                     if sell_reason == scale_exit_reason:
                         result["decision"] = "PARTIAL_EXIT_SENT"
                         replacement = api.apply_partial_exit_fill(pos, filled_size, ts)
+                        if replacement:
+                            replacement.pop("exchange_stop", None)
+                            exchange_stops.place(api, cfg, replacement, result, live=live)
                     else:
                         result["decision"] = "ORDER_SENT"
                         state["cooldown_until"] = (api.utcnow() + timedelta(minutes=float(cfg["cooldown_minutes_after_trade"]))).isoformat()

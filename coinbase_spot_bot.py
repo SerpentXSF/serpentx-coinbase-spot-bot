@@ -54,6 +54,7 @@ from indicators import (  # noqa: E402,F401  (re-exported: other scripts use bot
 )
 import alerts  # noqa: E402
 import config_check  # noqa: E402
+import exchange_stops  # noqa: E402
 import exits  # noqa: E402
 
 BASE_HOST = "api.coinbase.com"
@@ -1306,6 +1307,47 @@ def cancel_order(order_id: str) -> dict[str, Any]:
     return private_request("POST", "/api/v3/brokerage/orders/batch_cancel", {"order_ids": [order_id]})
 
 
+def cancel_succeeded(resp: dict[str, Any], order_id: str) -> bool:
+    """True when a batch_cancel response reports success for ``order_id``."""
+    for row in resp.get("results") or []:
+        if str(row.get("order_id")) == str(order_id):
+            return bool(row.get("success"))
+    return False
+
+
+def stop_limit_order_config(product_id: str, base_size: float, stop_price: float, limit_price: float) -> dict[str, Any]:
+    """Coinbase stop-limit GTC SELL that triggers when the price falls to ``stop_price``.
+
+    Field names follow Coinbase's official SDK (stop_limit_stop_limit_gtc).
+    Every placement is previewed first, so Coinbase validates this shape
+    before any real order is sent.
+    """
+    b = quantize_order_size(product_id, "base_size", base_size)
+    if _decimal_from(b) <= 0:
+        raise RuntimeError(f"{product_id} stop base_size is below Coinbase minimum after quantization")
+    stop_s = _quantize_price(product_id, stop_price)
+    limit_s = _quantize_price(product_id, limit_price)
+    if _decimal_from(stop_s) <= 0 or _decimal_from(limit_s) <= 0:
+        raise RuntimeError(f"{product_id} stop/limit price quantized to zero")
+    return {"stop_limit_stop_limit_gtc": {
+        "base_size": b,
+        "limit_price": limit_s,
+        "stop_price": stop_s,
+        "stop_direction": "STOP_DIRECTION_STOP_DOWN",
+    }}
+
+
+def preview_stop_limit(product_id: str, base_size: float, stop_price: float, limit_price: float) -> dict[str, Any]:
+    oc = stop_limit_order_config(product_id, base_size, stop_price, limit_price)
+    return private_request("POST", "/api/v3/brokerage/orders/preview", {"product_id": product_id, "side": "SELL", "order_configuration": oc})
+
+
+def place_stop_limit(product_id: str, base_size: float, stop_price: float, limit_price: float) -> dict[str, Any]:
+    oc = stop_limit_order_config(product_id, base_size, stop_price, limit_price)
+    body = {"client_order_id": str(uuid.uuid4()), "product_id": product_id, "side": "SELL", "order_configuration": oc}
+    return private_request("POST", "/api/v3/brokerage/orders", body)
+
+
 def normalize_pending_orders(state: dict[str, Any]) -> list[dict[str, Any]]:
     rows = state.get("pending_orders")
     if not isinstance(rows, list):
@@ -1942,6 +1984,9 @@ def run(cfg: dict[str, Any], *, status: bool=False, live: bool=False) -> dict[st
     # First priority: manage exits for existing bot-opened positions. Only one
     # live order is sent per run, so exits take precedence over new entries.
     if positions and not status and result["decision"] != "PENDING_ORDER_OPEN":
+        exchange_stops.sync(sys.modules[__name__], cfg, state, result, live=live)
+        positions = normalize_positions(state)
+    if positions and not status and result["decision"] != "PENDING_ORDER_OPEN":
         if not exits.manage_exits(sys.modules[__name__], cfg, state, positions, balances, result, live=live, context_cache=context_cache):
             # No exits; continue below only if another entry slot is available.
             if len(positions) >= max_positions:
@@ -2015,6 +2060,7 @@ def run(cfg: dict[str, Any], *, status: bool=False, live: bool=False) -> dict[st
                                 "high_water_pnl_pct": 0.0,
                                 "entry_candle_low": min([fnum(c.get("low")) for c in fetch_candles(entry_signal.product_id, cfg.get("bar_exec", "FIFTEEN_MINUTE"), 4)[-4:] if fnum(c.get("low")) > 0] or [entry_signal.price]),
                             })
+                            exchange_stops.place(sys.modules[__name__], cfg, positions[-1], result, live=live)
                             persist_positions(state, positions)
                             append_jsonl(Path(cfg["trades_log_path"]), {"ts": result["ts"], "side": "BUY", "order": order, "signal": entry_signal.__dict__, "quote_size": quote_size, "order_type": "MARKET_IOC", "fill": fill})
                     else:
