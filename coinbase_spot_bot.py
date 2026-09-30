@@ -157,6 +157,37 @@ def append_jsonl(path: Path, data: dict[str, Any]) -> None:
         f.write(json.dumps(data, sort_keys=True) + "\n")
 
 
+def append_jsonl_rotating(path: Path, data: dict[str, Any], max_bytes: int = 10_000_000, backups: int = 5) -> None:
+    """Append like append_jsonl, rotating ``path`` -> ``path.1`` .. ``path.N`` once it reaches ``max_bytes``.
+
+    Used for the high-volume runs log only; trades.jsonl is never rotated
+    because it is the P&L history the dashboard and reconciler read.
+    """
+    path = Path(path)
+    try:
+        if max_bytes > 0 and path.exists() and path.stat().st_size >= max_bytes:
+            for i in range(backups - 1, 0, -1):
+                src = path.with_name(f"{path.name}.{i}")
+                if src.exists():
+                    src.replace(path.with_name(f"{path.name}.{i + 1}"))
+            if backups > 0:
+                path.replace(path.with_name(f"{path.name}.1"))
+            else:
+                path.unlink()
+    except OSError:
+        pass  # never let log housekeeping block a trading run
+    append_jsonl(path, data)
+
+
+def append_run_log(cfg: dict[str, Any], data: dict[str, Any]) -> None:
+    append_jsonl_rotating(
+        Path(cfg["runs_log_path"]),
+        data,
+        int(cfg.get("runs_log_max_bytes", 10_000_000)),
+        int(cfg.get("runs_log_backups", 5)),
+    )
+
+
 def load_dotenv(path: str | Path) -> None:
     p = Path(path)
     if not p.exists():
@@ -1018,20 +1049,24 @@ def _apply_fee_guard(cfg: dict[str, Any], sig: Signal) -> Signal:
     return sig
 
 
-def score_product(cfg: dict[str, Any], product_id: str) -> Signal:
-    info = product_info(product_id)
-    if not is_market_orderable_product(info):
-        s = Signal(product_id, fnum(info.get("price")), 0, "HOLD_USDC", ["product not market-orderable"], 50, fnum(info.get("price_percentage_change_24h")), fnum(info.get("volume_24h")))
-        s.risk_block = True
-        return s
-    exec_c = fetch_candles(product_id, cfg["bar_exec"], int(cfg["lookback_exec_hours"]))
-    trend_c = fetch_candles(product_id, cfg["bar_trend"], int(cfg["lookback_trend_hours"]))
+def technical_long_score(cfg: dict[str, Any], exec_c: list[dict[str, Any]], trend_c: list[dict[str, Any]], price: float | None, chg: float, vol: float) -> dict[str, Any]:
+    """The bot's candle-based long score, with no network calls.
+
+    Shared by score_product() and the USDC scanner so the rotator ranks
+    products by the same rules (timeframes, EMA stack, 30m regime gate, RSI,
+    divergence) the bot applies before buying. ``price`` falls back to the last
+    exec close only when it is None (missing/unparseable ticker price).
+    """
     closes = [fnum(c.get("close")) for c in exec_c if fnum(c.get("close")) > 0]
     trend_closes = [fnum(c.get("close")) for c in trend_c if fnum(c.get("close")) > 0]
-    price = fnum(info.get("price"), closes[-1] if closes else 0)
+    if price is None:
+        price = closes[-1] if closes else 0.0
     avg_exec_range = _avg_range_pct(exec_c)
+    out: dict[str, Any] = {"price": price, "avg_exec_range_pct": avg_exec_range, "insufficient": False}
     if len(closes) < 30 or len(trend_closes) < 20 or price <= 0:
-        return Signal(product_id, price, 0, "HOLD", ["insufficient candle history"], 50, fnum(info.get("price_percentage_change_24h")), fnum(info.get("volume_24h")), avg_exec_range_pct=avg_exec_range)
+        out.update({"insufficient": True, "score": 0, "reasons": ["insufficient candle history"], "rsi": 50.0,
+                    "regime_block": False, "rsi_divergence": {}, "rsi_divergence_label": "None", "rsi_divergence_signal": "none"})
+        return out
     ema9 = ema(closes[-60:], 9)
     ema21 = ema(closes[-80:], 21)
     ema50 = ema(closes[-120:], 50)
@@ -1044,10 +1079,8 @@ def score_product(cfg: dict[str, Any], product_id: str) -> Signal:
         swing_window=int(cfg.get("rsi_divergence_swing_window", 2)),
         lookback=int(cfg.get("rsi_divergence_lookback_candles", 80)),
     )
-    chg = fnum(info.get("price_percentage_change_24h"))
-    vol = fnum(info.get("volume_24h"))
     score = 0
-    reasons = []
+    reasons: list[str] = []
 
     # Spot-only: buy strength on trend alignment or controlled pullbacks; otherwise hold USDC.
     if ema9 > ema21 > ema50:
@@ -1077,6 +1110,35 @@ def score_product(cfg: dict[str, Any], product_id: str) -> Signal:
         score += 1; reasons.append("active volume")
     if avg_exec_range >= float(cfg.get("min_avg_exec_range_pct", 0.0)):
         reasons.append(f"avg exec range {avg_exec_range*100:.2f}%")
+    out.update({
+        "score": score,
+        "reasons": reasons,
+        "rsi": cur_rsi,
+        "regime_block": any("regime gate failed" in r for r in reasons),
+        "rsi_divergence": divergence,
+        "rsi_divergence_label": div_label,
+        "rsi_divergence_signal": div_signal,
+        "ema9": ema9, "ema21": ema21, "ema50": ema50, "trend_ema20": trend20, "trend_ema50": trend50,
+    })
+    return out
+
+
+def score_product(cfg: dict[str, Any], product_id: str) -> Signal:
+    info = product_info(product_id)
+    if not is_market_orderable_product(info):
+        s = Signal(product_id, fnum(info.get("price")), 0, "HOLD_USDC", ["product not market-orderable"], 50, fnum(info.get("price_percentage_change_24h")), fnum(info.get("volume_24h")))
+        s.risk_block = True
+        return s
+    exec_c = fetch_candles(product_id, cfg["bar_exec"], int(cfg["lookback_exec_hours"]))
+    trend_c = fetch_candles(product_id, cfg["bar_trend"], int(cfg["lookback_trend_hours"]))
+    chg = fnum(info.get("price_percentage_change_24h"))
+    vol = fnum(info.get("volume_24h"))
+    tech = technical_long_score(cfg, exec_c, trend_c, fnum(info.get("price"), None), chg, vol)
+    if tech["insufficient"]:
+        return Signal(product_id, tech["price"], 0, "HOLD", ["insufficient candle history"], 50, chg, vol, avg_exec_range_pct=tech["avg_exec_range_pct"])
+    score = tech["score"]
+    reasons = tech["reasons"]
+    price = tech["price"]
     htf = cfg.get("higher_timeframe_regime_gate", {})
     if htf.get("enabled"):
         try:
@@ -1099,13 +1161,13 @@ def score_product(cfg: dict[str, Any], product_id: str) -> Signal:
             reasons.append(f"higher timeframe gate unavailable: {str(exc)[:80]}")
     regime_block = any("regime gate failed" in r for r in reasons)
     action = "BUY" if score >= int(cfg["score_threshold"]) and not regime_block else "HOLD_USDC"
-    sig = Signal(product_id, price, score, action, reasons, cur_rsi, chg, vol, avg_exec_range_pct=avg_exec_range)
+    sig = Signal(product_id, price, score, action, reasons, tech["rsi"], chg, vol, avg_exec_range_pct=tech["avg_exec_range_pct"])
     if regime_block:
         sig.risk_block = True
         sig.reasons.append("regime gate blocked long entry")
-    sig.rsi_divergence = divergence
-    sig.rsi_divergence_label = div_label
-    sig.rsi_divergence_signal = div_signal
+    sig.rsi_divergence = tech["rsi_divergence"]
+    sig.rsi_divergence_label = tech["rsi_divergence_label"]
+    sig.rsi_divergence_signal = tech["rsi_divergence_signal"]
     if sig.action == "BUY":
         sig = _apply_five_minute_confirmation(cfg, sig)
         sig = _apply_fee_guard(cfg, sig)
@@ -2076,7 +2138,7 @@ def run(cfg: dict[str, Any], *, status: bool=False, live: bool=False) -> dict[st
     state["last_decision"] = result["decision"]
     state["last_top"] = top.__dict__
     save_json(state_path, state)
-    append_jsonl(Path(cfg["runs_log_path"]), result)
+    append_run_log(cfg, result)
     return result
 
 

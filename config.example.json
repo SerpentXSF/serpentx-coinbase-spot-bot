@@ -151,6 +151,8 @@
   "rsi_divergence_period": 14,
   "rsi_divergence_swing_window": 2,
   "run_lock_stale_seconds": 900,
+  "runs_log_backups": 5,
+  "runs_log_max_bytes": 10000000,
   "runs_log_path": "logs/runs.jsonl",
   "scale_exit_enabled": true,
   "scale_exit_fraction": 0.5,

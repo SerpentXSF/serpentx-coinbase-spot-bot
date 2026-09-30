@@ -204,6 +204,8 @@ python coinbase_spot_bot.py --config config.json
 
 Scans Coinbase USDC pairs, writes the top 5 to `allowed_products` in your `config.json` (other settings are preserved), then runs the bot in preview mode.
 
+The scanner uses the same candle timeframes as the bot (`bar_exec` / `bar_trend` and their lookbacks in `config.json`) and scores every pair with the bot's own technical scoring. Pairs the bot would actually accept (the 30m regime gate passes and the score is at least `score_threshold`) rank first. The scanner's liquidity/momentum score orders pairs within each group. Each row in `analysis/usdc_pairs_latest.json` shows `bot_score`, `bot_regime_ok` and `bot_eligible`.
+
 ```bash
 python rotate_and_run.py --json
 ```
@@ -288,6 +290,8 @@ Before scheduling, create the local runtime folders. They are ignored by git so 
 ```bash
 mkdir -p state logs analysis
 ```
+
+`logs/runs.jsonl` gets a detailed entry on every run and exit-monitor tick, so it rotates automatically at `runs_log_max_bytes` (default 10 MB) and keeps `runs_log_backups` old files (default 5, named `runs.jsonl.1` ... `.5`). `logs/trades.jsonl` is your trade history and is never rotated.
 
 ### Linux/macOS cron
 

@@ -91,7 +91,7 @@ def run(*, live: bool = False, json_status: bool = False) -> dict[str, Any]:
     if pending_orders:
         result["decision"] = "PENDING_ORDER_OPEN"
         bot.save_json(state_path, state)
-        bot.append_jsonl(Path(cfg["runs_log_path"]), result)
+        bot.append_run_log(cfg, result)
         return result
 
     updated_positions: list[dict[str, Any]] = []
@@ -230,7 +230,7 @@ def run(*, live: bool = False, json_status: bool = False) -> dict[str, Any]:
     if result["decision"] != "HOLD_POSITIONS" or json_status:
         state["last_exit_monitor_result"] = result
     bot.save_json(state_path, state)
-    bot.append_jsonl(Path(cfg["runs_log_path"]), result)
+    bot.append_run_log(cfg, result)
     return result
 
 

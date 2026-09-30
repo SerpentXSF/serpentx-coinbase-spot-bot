@@ -85,9 +85,37 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
     return rows
 
 
-def latest_jsonl(path: Path) -> dict[str, Any]:
-    rows = read_jsonl(path)
-    return rows[-1] if rows else {}
+def latest_jsonl(path: Path, block_size: int = 65536) -> dict[str, Any]:
+    """Return the last valid JSON line by reading backwards from the end.
+
+    The runs log can hold thousands of multi-KB entries; parsing the whole
+    file on every dashboard refresh gets slower forever.
+    """
+    try:
+        with path.open('rb') as f:
+            f.seek(0, 2)
+            pos = f.tell()
+            data = b''
+            while pos > 0:
+                step = min(block_size, pos)
+                pos -= step
+                f.seek(pos)
+                data = f.read(step) + data
+                lines = data.splitlines()
+                # The first line may be cut off mid-record until we reach the file start.
+                complete = lines[1:] if pos > 0 else lines
+                for raw in reversed(complete):
+                    if raw.strip():
+                        try:
+                            row = json.loads(raw)
+                        except Exception:
+                            continue
+                        if isinstance(row, dict):
+                            return row
+                block_size *= 2
+    except OSError:
+        return {}
+    return {}
 
 
 def _context_score(ctx: dict[str, Any], name: str) -> int:

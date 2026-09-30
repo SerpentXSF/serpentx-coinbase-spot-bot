@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- The USDC scanner now ranks pairs by the same rules the bot trades by. It had been using 1-hour trend candles (labelled "30m") and 120h/30h lookbacks, while the bot uses `bar_trend` (30m) with 48h/24h lookbacks, and the scanner ignored the bot's 30m regime gate, so the rotator could fill the watchlist with pairs the bot would refuse. The scanner now reads the timeframes from `config.json`, scores each pair with the bot's own `technical_long_score()`, and ranks bot-eligible pairs first. Rows include `bot_score`, `bot_regime_ok`, `bot_eligible`, and `analysis/usdc_pairs_latest.json` records the `timeframes` used.
+- The bot's candle scoring moved into `technical_long_score()`, a function with no network calls, with no behaviour change (verified identical on 1,300 randomized markets). The scanner's duplicate EMA/RSI code now uses the bot's.
+- `logs/runs.jsonl` rotates at `runs_log_max_bytes` (default 10 MB) and keeps `runs_log_backups` files (default 5). `trades.jsonl` is never rotated.
+- The dashboard reads only the end of the runs log for the latest run. On a 153 MB log: 6.4 s down to under 1 ms.
 - Fixed `rotate_and_run.py` / `analyze_usdc_pairs.py` and `candidate_forward_backtest.py` crashing on startup with `NameError: name 'os' is not defined`.
 - Fixed the README quick start failing with `Coinbase private key must be PEM text` when `.env` was copied from the template but not yet filled in; placeholder credentials now count as "no credentials" and the template ships blank.
 - Fixed the dashboard reading `state.json` / `trades.jsonl` from the repo root instead of the `state/` and `logs/` paths the bot writes, so positions, cooldowns, and trades now appear.
