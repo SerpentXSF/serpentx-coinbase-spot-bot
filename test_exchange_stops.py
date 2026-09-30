@@ -289,3 +289,29 @@ class SyncRobustnessTests(StopHarness):
             result = bot.run(self.cfg, live=True)
         self.assertEqual(result["decision"], "ORDER_SENT")
         self.assertIn("price lookup failed", self.read_state()["open_positions"][0]["exchange_stop_error"])
+
+
+class IdempotencyTests(StopHarness):
+    def test_a_stop_fill_is_never_booked_twice(self) -> None:
+        self.write_state({"open_positions": [self.position(stop_oid="stop-9")]})
+        self.order_details["stop-9"] = {"status": "FILLED", "filled_size": "10", "average_filled_price": "0.945", "total_fees": "0.11"}
+        state = self.read_state()
+        result = {"ts": "2026-09-30T12:00:00+00:00"}
+        pos = state["open_positions"][0]
+        first = exchange_stops.record_stop_fill(bot, self.cfg, state, dict(pos), self.order_details["stop-9"], result)
+        # A crash before saving leaves the old position (with the filled stop) in state; the retry must not re-book.
+        second = exchange_stops.record_stop_fill(bot, self.cfg, state, dict(pos), self.order_details["stop-9"], result)
+        self.assertIsNone(first)
+        self.assertIsNone(second)
+        self.assertEqual(state["daily_realized_pnl"]["exits"], 1)
+        self.assertEqual(len(self.trades()), 1)
+
+    def test_failure_while_re_placing_after_a_partial_fill_keeps_the_reduced_position(self) -> None:
+        self.write_state({"open_positions": [self.position(stop_oid="stop-9")]})
+        self.order_details["stop-9"] = {"status": "CANCELLED", "filled_size": "4", "average_filled_price": "0.945", "total_fees": "0.05"}
+        with patch.object(exchange_stops, "place", side_effect=ValueError("bad config value")):
+            exchange_stops.sync(bot, self.cfg, state := self.read_state(), {"ts": "2026-09-30T12:00:00+00:00"}, live=True)
+        [pos] = state["open_positions"]
+        self.assertEqual(pos["base_size_est"], 6.0)
+        self.assertNotIn("exchange_stop", pos)
+        self.assertEqual(state["daily_realized_pnl"]["exits"], 1)

@@ -66,8 +66,8 @@ def place(api: ModuleType, cfg: dict[str, Any], pos: dict[str, Any], result: dic
     size = api.fnum(pos.get("base_size_est"))
     if entry <= 0 or size <= 0:
         return False
-    stop, limit = stop_prices(cfg, entry)
     try:
+        stop, limit = stop_prices(cfg, entry)
         current = api.fnum(api.product_info(product_id).get("price"))
     except Exception as exc:
         pos["exchange_stop_error"] = f"price lookup failed: {str(exc)[:200]}"
@@ -106,8 +106,18 @@ def place(api: ModuleType, cfg: dict[str, Any], pos: dict[str, Any], result: dic
 
 
 def record_stop_fill(api: ModuleType, cfg: dict[str, Any], state: dict[str, Any], pos: dict[str, Any], detail: dict[str, Any], result: dict[str, Any]) -> dict[str, Any] | None:
-    """Book an exchange-stop fill: P&L, cooldowns, trade log. Returns the remaining position (None if closed)."""
+    """Book an exchange-stop fill: P&L, cooldowns, trade log. Returns the remaining position (None if closed).
+
+    Idempotent per stop order: a fill already booked (e.g. by a run that then
+    failed before saving the reduced position) is never booked twice.
+    """
     fnum = api.fnum
+    oid = str((pos.get("exchange_stop") or {}).get("order_id") or "")
+    booked = state.setdefault("booked_exchange_stop_fills", [])
+    remaining = dict(pos)
+    remaining.pop("exchange_stop", None)
+    if oid and oid in booked:
+        return api.apply_partial_exit_fill(remaining, fnum(detail.get("filled_size")), result["ts"])
     filled = fnum(detail.get("filled_size"))
     price = fnum(detail.get("average_filled_price")) or fnum((pos.get("exchange_stop") or {}).get("limit_price"))
     fill = {"order_id": (pos.get("exchange_stop") or {}).get("order_id"), "status": detail.get("status"), "filled_size": filled,
@@ -115,6 +125,9 @@ def record_stop_fill(api: ModuleType, cfg: dict[str, Any], state: dict[str, Any]
             "total_fees": fnum(detail.get("total_fees"))}
     realized = api.realized_pnl_quote(cfg, pos, filled, fill, price)
     api.record_realized_pnl(state, realized, result["ts"])
+    if oid:
+        booked.append(oid)
+        del booked[:-100]  # keep the marker list small
     product_id = str(pos.get("product_id"))
     api.set_product_cooldown(state, product_id, float(cfg.get("per_product_cooldown_minutes_after_stop", 720)))
     state["cooldown_until"] = (api.utcnow() + timedelta(minutes=float(cfg["cooldown_minutes_after_trade"]))).isoformat()
@@ -123,10 +136,7 @@ def record_stop_fill(api: ModuleType, cfg: dict[str, Any], state: dict[str, Any]
         "position": pos, "base_size": filled, "order_type": "STOP_LIMIT_GTC", "fill": fill, "realized_pnl_quote": realized,
     })
     _event(result, "EXCHANGE_STOP_FILLED", pos, filled_size=filled, average_filled_price=price, realized_pnl_quote=realized)
-    remaining = dict(pos)
-    remaining.pop("exchange_stop", None)
-    updated = api.apply_partial_exit_fill(remaining, filled, result["ts"])
-    return updated
+    return api.apply_partial_exit_fill(remaining, filled, result["ts"])
 
 
 def sync(api: ModuleType, cfg: dict[str, Any], state: dict[str, Any], result: dict[str, Any], *, live: bool) -> None:
@@ -164,8 +174,11 @@ def _sync_one(api: ModuleType, cfg: dict[str, Any], state: dict[str, Any], pos: 
         if api.fnum(detail.get("filled_size")) > 0 and (status in DONE_STATUSES):
             remaining = record_stop_fill(api, cfg, state, pos, detail, result)
             if remaining:
-                place(api, cfg, remaining, result, live=live)
-                updated.append(remaining)
+                updated.append(remaining)  # commit the reduced position before anything else can fail
+                try:
+                    place(api, cfg, remaining, result, live=live)
+                except Exception as exc:
+                    remaining["exchange_stop_error"] = f"re-place failed: {str(exc)[:200]}"
             return
         if status in DONE_STATUSES:
             pos.pop("exchange_stop", None)
